@@ -1,0 +1,75 @@
+# Recommended configuration for the `claude` launcher.
+# This is the launcher named in issue #129 (was wired to a 3B model -- bad).
+# Gives a stronger agent-model recommendation (30B first) and adds sub-agent
+# capability entries that the wildcard file does not cover.
+
+launcher: "claude"
+
+capabilities:
+
+  - capability: sub-agent-code
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-30b
+            variant_precisions:
+              - OpenRouter
+              - Ollama
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+              - safetensors
+
+  - capability: sub-agent-explore
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-8b
+            variant_precisions:
+              - Ollama
+              - OpenRouter
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+              - safetensors
+          - model: granite-4.2-3b
+            variant_precisions:
+              - Ollama
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+              - safetensors
+
+  - capability: sub-agent-plan
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-30b
+            variant_precisions:
+              - OpenRouter
+              - Ollama
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+              - BF16
+              - bfloat16
+
+  - capability: vision-mcp
+    models:
+      model_id:
+        min_context_length: 4096
+        models:
+          - model: granite-vision-4.1-4b
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+              - BF16
