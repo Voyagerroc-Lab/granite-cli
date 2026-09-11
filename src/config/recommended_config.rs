@@ -81,11 +81,28 @@ pub struct RecommendedModelSet {
 }
 
 /// One candidate model and which of its variants are acceptable.
+///
+/// A variant is admitted when it matches `variant_formats` (or that list is
+/// empty) *and* matches `variant_precisions` (or that list is empty) -- AND
+/// logic between the two fields, OR logic within each. To express
+/// alternatives that don't fit one AND (e.g. "any precision on Ollama, OR
+/// Q4_K_M-or-better on GGUF"), list the same `model` more than once in the
+/// enclosing `RecommendedModelSet.models` with different constraints --
+/// candidates are already tried in order, first admissible one wins, so
+/// this composes for free rather than needing a third list here.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RecommendedModel {
     pub model: StringMatch,
+    /// Per-model format allow-list (e.g. "GGUF", "Ollama", "OpenRouter");
+    /// empty means any format is acceptable. Lets a config say "just use
+    /// the Ollama-served build" (`variant_formats: [Ollama]`, no precision
+    /// constraint) or restrict a hosted/API provider format that has no
+    /// quantization precision to speak of at all.
+    #[serde(default)]
+    pub variant_formats: Vec<StringMatch>,
     /// Per-model precision allow-list (e.g. "Q4_K_M", "IQ4_XS"); empty means
     /// any variant is acceptable.
+    #[serde(default)]
     pub variant_precisions: Vec<StringMatch>,
 }
 
@@ -138,30 +155,28 @@ fn resolve_entry<'a>(
         .or_else(|| builtin.iter().find(|c| c.launcher == key))
 }
 
-/// The effective capability list for one launcher: the launcher's own
-/// entry (if any) unioned with the wildcard ("*") entry (if any), with the
-/// launcher's own entry winning per-`capability` key when both define the
-/// same capability.
+/// The effective capability list for one launcher: if the launcher has its
+/// own entry (user- or builtin-authored), that entry is authoritative and
+/// complete -- the wildcard ("*") entry is consulted only when the launcher
+/// has no entry of its own at all. The two are never blended.
+///
+/// A launcher's own entry omitting a capability the wildcard recommends is a
+/// deliberate statement, not a gap to fill in: e.g. `claude.yaml` not
+/// listing `agent-model` means "claude sticks with its own upstream model
+/// for the main agent," not "fall back to whatever the wildcard says."
+/// Blending the two would silently reintroduce exactly that kind of
+/// unwanted recommendation.
 pub fn effective_capabilities(
     launcher_type: &str,
     builtin: &[RecommendedConfiguration],
     user: &HashMap<String, RecommendedConfiguration>,
 ) -> Vec<RecommendedCapability> {
-    let specific = resolve_entry(launcher_type, builtin, user);
-    let wildcard = resolve_entry("*", builtin, user);
-
-    let mut by_capability: HashMap<String, RecommendedCapability> = HashMap::new();
-    if let Some(w) = wildcard {
-        for cap in &w.capabilities {
-            by_capability.insert(cap.capability.clone(), cap.clone());
-        }
+    if let Some(specific) = resolve_entry(launcher_type, builtin, user) {
+        return specific.capabilities.clone();
     }
-    if let Some(s) = specific {
-        for cap in &s.capabilities {
-            by_capability.insert(cap.capability.clone(), cap.clone());
-        }
-    }
-    by_capability.into_values().collect()
+    resolve_entry("*", builtin, user)
+        .map(|wildcard| wildcard.capabilities.clone())
+        .unwrap_or_default()
 }
 
 // -- Tests ----------------------------------------------------------------------
@@ -230,6 +245,7 @@ mod tests {
                 min_context_length: None,
                 models: vec![RecommendedModel {
                     model: StringMatch::Exact(model_val.to_string()),
+                    variant_formats: vec![],
                     variant_precisions: vec![],
                 }],
             },
@@ -271,9 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn specific_wins_over_wildcard_for_same_capability_key() {
-        // Both wildcard and specific define capability "agent-model".
-        // The specific launcher's RecommendedCapability must win.
+    fn specific_entry_wins_over_wildcard_when_both_define_the_same_capability() {
+        // Both wildcard and specific define capability "agent-model". The
+        // specific launcher's entry is authoritative, so its
+        // RecommendedCapability must win.
         let mut specific_models = HashMap::new();
         specific_models.insert(
             "model_id".to_string(),
@@ -281,6 +298,7 @@ mod tests {
                 min_context_length: None,
                 models: vec![RecommendedModel {
                     model: StringMatch::Exact("specific-model".to_string()),
+                    variant_formats: vec![],
                     variant_precisions: vec![],
                 }],
             },
@@ -293,6 +311,7 @@ mod tests {
                 min_context_length: None,
                 models: vec![RecommendedModel {
                     model: StringMatch::Exact("wildcard-model".to_string()),
+                    variant_formats: vec![],
                     variant_precisions: vec![],
                 }],
             },
@@ -327,9 +346,13 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_capabilities_union_with_specific() {
-        // Specific launcher defines "agent-model", wildcard defines
-        // "sub-agent-cap". Both should appear in the result.
+    fn a_launchers_own_entry_excludes_wildcard_capabilities_entirely() {
+        // Specific launcher defines only "agent-model"; wildcard separately
+        // defines "sub-agent-cap". A launcher's own entry is authoritative
+        // and complete -- the wildcard must NOT be blended in, so
+        // "sub-agent-cap" must not appear even though the wildcard lists it.
+        // (This is exactly the claude.yaml case: it deliberately omits
+        // agent-model to mean "don't use it," not "fall back to default.")
         let builtin = vec![
             make_config("claude", "agent-model", "specific-model"),
             make_config("*", "sub-agent-cap", "wildcard-model"),
@@ -337,10 +360,8 @@ mod tests {
         let user = HashMap::new();
 
         let caps = effective_capabilities("claude", &builtin, &user);
-        assert_eq!(caps.len(), 2);
-        let names: Vec<&str> = caps.iter().map(|c| c.capability.as_str()).collect();
-        assert!(names.contains(&"agent-model"));
-        assert!(names.contains(&"sub-agent-cap"));
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].capability, "agent-model");
     }
 
     #[test]
@@ -362,31 +383,51 @@ mod tests {
     }
 
     #[test]
-    fn builtin_contains_claude_agent_model() {
-        // The built-in configs must include a claude entry whose capabilities
-        // contain an agent-model capability.
+    fn builtin_contains_claude_sub_agent_code() {
+        // The built-in configs must include a claude entry with its own
+        // sub-agent-code recommendation (claude.yaml deliberately doesn't
+        // define agent-model itself, and -- since a launcher's own entry is
+        // authoritative -- that means claude never gets agent-model at all,
+        // not that it falls back to the wildcard; check a capability
+        // claude.yaml actually owns instead).
         let mut found_claude = false;
         for cfg in &*BUILTIN_RECOMMENDED_CONFIGS {
             if cfg.launcher == "claude" {
                 found_claude = true;
-                let agent_model = cfg
+                let sub_agent_code = cfg
                     .capabilities
                     .iter()
-                    .find(|c| c.capability == "agent-model");
+                    .find(|c| c.capability == "sub-agent-code");
                 assert!(
-                    agent_model.is_some(),
-                    "claude config must define 'agent-model' capability"
+                    sub_agent_code.is_some(),
+                    "claude config must define 'sub-agent-code' capability"
                 );
-                let agent_model = agent_model.unwrap();
+                let sub_agent_code = sub_agent_code.unwrap();
                 assert!(
-                    agent_model.models.contains_key("model_id"),
-                    "claude agent-model must have a 'model_id' slot"
+                    sub_agent_code.models.contains_key("model_id"),
+                    "claude sub-agent-code must have a 'model_id' slot"
                 );
             }
         }
         assert!(
             found_claude,
             "BUILTIN_RECOMMENDED_CONFIGS must contain a 'claude' launcher entry"
+        );
+    }
+
+    #[test]
+    fn claude_never_gets_agent_model_from_the_wildcard() {
+        // claude.yaml deliberately doesn't define agent-model itself,
+        // meaning "claude sticks with its own upstream model for the main
+        // agent" -- NOT "fall back to the wildcard's recommendation." Since
+        // claude has its own entry, the wildcard must not be consulted at
+        // all, so agent-model must be absent from claude's effective
+        // capabilities.
+        let caps = effective_capabilities("claude", &BUILTIN_RECOMMENDED_CONFIGS, &HashMap::new());
+        assert!(
+            !caps.iter().any(|c| c.capability == "agent-model"),
+            "claude has its own recommended config, so it must not inherit agent-model \
+             from the wildcard"
         );
     }
 
