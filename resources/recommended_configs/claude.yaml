@@ -10,12 +10,17 @@ capabilities:
         min_context_length: 65536
         models:
           - model: granite-4.2-30b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-30b
+            variant_formats:
+              - Ollama
+              - GGUF
             variant_precisions:
               - Q4_K_M
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - bfloat16
 
   - capability: sub-agent-explore
     models:
@@ -23,12 +28,14 @@ capabilities:
         min_context_length: 65536
         models:
           - model: granite-4.2-3b
+            variant_formats:
+              - Ollama
+              - GGUF
             variant_precisions:
               - Q4_K_M
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - bfloat16
 
   - capability: sub-agent-plan
     models:
@@ -36,13 +43,17 @@ capabilities:
         min_context_length: 65536
         models:
           - model: granite-4.2-30b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-30b
+            variant_formats:
+              - Ollama
+              - GGUF
             variant_precisions:
               - Q4_K_M
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - BF16
-              - bfloat16
 
   - capability: vision-mcp
     models:
@@ -55,4 +66,3 @@ capabilities:
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - BF16

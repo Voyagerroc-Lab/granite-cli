@@ -10,19 +10,26 @@ capabilities:
         min_context_length: 65536
         models:
           - model: granite-4.2-30b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-30b
+            variant_formats:
+              - Ollama
+              - GGUF
             variant_precisions:
               - Q4_K_M
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - bfloat16
           - model: granite-4.2-8b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-8b
+            variant_formats:
+              - Ollama
+              - GGUF
             variant_precisions:
-              - Q4_K_M
-              - Q5_K_M
-              - Q6_K
               - Q8_0
-              - bfloat16
 
   - capability: vision-mcp
     models:
