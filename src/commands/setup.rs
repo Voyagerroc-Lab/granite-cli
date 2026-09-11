@@ -710,6 +710,51 @@ fn best_variant_among<'a>(
         .map(|(fit, v)| (v.clone(), fit))
 }
 
+/// Rank every variant that fits at all, best first, using the same
+/// ordering `best_variant_among` picks its single winner with. Unlike
+/// `best_variant_among`, returns the whole ranked list rather than just the
+/// top entry -- needed by `resolve_model_set`, which must be able to fall
+/// through to the next-best variant when the top-ranked one turns out to be
+/// unusable for a reason unrelated to fit (e.g. no healthy provider can
+/// actually serve its format).
+fn rank_variants_among<'a>(
+    variants: impl Iterator<Item = &'a ModelVariant>,
+    context_length: u64,
+    architecture: &crate::models::ModelArchitecture,
+    native_dtype: &str,
+    profile: &crate::utils::hardware::HardwareProfile,
+) -> Vec<(ModelVariant, ContextFit)> {
+    let fit_rank = |fit: &ContextFit| match fit {
+        ContextFit::Full => 1,
+        ContextFit::Partial(_) => 0,
+        ContextFit::None => -1,
+    };
+
+    let mut ranked: Vec<(ModelVariant, ContextFit)> = variants
+        .map(|v| {
+            let fit = crate::models::context_fit::estimate(
+                context_length,
+                architecture,
+                native_dtype,
+                v,
+                profile,
+            );
+            (v.clone(), fit)
+        })
+        .filter(|(_, fit)| *fit != ContextFit::None)
+        .collect();
+
+    ranked.sort_by(|(a, fit_a), (b, fit_b)| {
+        fit_rank(fit_b).cmp(&fit_rank(fit_a)).then_with(|| {
+            b.size_gb
+                .partial_cmp(&a.size_gb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    ranked
+}
+
 fn display_name(rec: &Recommendation) -> String {
     match rec {
         Recommendation::Provider { provider_name, .. } => provider_name.clone(),
@@ -871,7 +916,13 @@ fn resolve_capability(
 }
 
 /// Resolve a single `RecommendedModelSet` to a concrete `(model_id, variant)`
-/// pair. Tries candidates in declared order (first-match-wins semantics).
+/// pair. Tries candidates in declared order (first-match-wins semantics);
+/// within one candidate, tries every hardware-fitting variant that admits
+/// (format, precision) allow-lists, best fit first, rather than stopping at
+/// the single best-ranked one -- the best-ranked variant by fit/size alone
+/// may turn out to be unrunnable by any healthy provider (e.g. a
+/// `safetensors` variant when only Ollama is healthy) even though a
+/// slightly-lower-ranked variant in the same allow-list would work fine.
 fn resolve_model_set(
     set: &recommended_config::RecommendedModelSet,
     hardware: &crate::utils::hardware::HardwareProfile,
@@ -887,14 +938,21 @@ fn resolve_model_set(
                 None => continue,
             };
 
-            // Filter variants by precision allow-list, then pick the best fit
-            let best = best_variant_among(
+            // Filter variants by the format and precision allow-lists (AND
+            // between the two fields, OR within each; empty = wildcard),
+            // then rank every one that fits, best first.
+            let ranked = rank_variants_among(
                 md.variants.iter().filter(|v| {
-                    rec_model.variant_precisions.is_empty()
+                    (rec_model.variant_formats.is_empty()
                         || rec_model
-                            .variant_precisions
+                            .variant_formats
                             .iter()
-                            .any(|p| p.matches(&v.precision))
+                            .any(|f| f.matches(&v.format)))
+                        && (rec_model.variant_precisions.is_empty()
+                            || rec_model
+                                .variant_precisions
+                                .iter()
+                                .any(|p| p.matches(&v.precision)))
                 }),
                 md.context_length,
                 &md.architecture,
@@ -902,12 +960,12 @@ fn resolve_model_set(
                 hardware,
             );
 
-            if let Some((variant, fit)) = best {
+            for (variant, fit) in ranked {
                 // Compute effective context length from the fit
                 let effective_context = match fit {
                     ContextFit::Full => md.context_length,
                     ContextFit::Partial(n) => n,
-                    ContextFit::None => continue, // Already excluded by best_variant_among
+                    ContextFit::None => continue, // Already excluded by rank_variants_among
                 };
 
                 // Check min_context_length gate (against effective, not native)
@@ -1005,7 +1063,25 @@ impl SetupCommands {
         let selected_variants =
             Self::select_variants(ctx, &discovery, &selected_models, &selected_providers).await?;
 
-        // Phase 5: Configuration
+        // Phase 5: Configuration. Same per-launcher recommended-capability
+        // tracking as `run_auto_with_hardware`, so a capability recommended
+        // for one selected launcher doesn't also land on another selected
+        // launcher just because both happen to support its binding type.
+        let recommended_capability_types_by_launcher: HashMap<String, HashSet<String>> =
+            selected_launchers
+                .iter()
+                .map(|launcher_type| {
+                    let types = recommended_config::effective_capabilities(
+                        launcher_type,
+                        &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+                        &ctx.config.recommended_configs,
+                    )
+                    .into_iter()
+                    .map(|c| c.capability)
+                    .collect();
+                    (launcher_type.clone(), types)
+                })
+                .collect();
         Self::configure_all(
             ctx,
             &discovery,
@@ -1015,6 +1091,7 @@ impl SetupCommands {
             &selected_models,
             &selected_variants,
             &HashMap::new(),
+            &recommended_capability_types_by_launcher,
         )
         .await?;
 
@@ -1094,6 +1171,15 @@ impl SetupCommands {
         let mut selected_providers: HashSet<String> = HashSet::new();
         let mut resolved_capability_models: HashMap<String, HashMap<String, String>> =
             HashMap::new();
+        // launcher_type -> capability_types that launcher's own effective
+        // config lists, whether or not resolution for it succeeded --
+        // recorded regardless of outcome, since it reflects the launcher's
+        // own curated intent, not just what happened to resolve. Passed to
+        // `configure_all` so a capability recommended for one launcher
+        // never gets enabled on a different one just because their binding
+        // types happen to overlap too.
+        let mut recommended_capability_types_by_launcher: HashMap<String, HashSet<String>> =
+            HashMap::new();
 
         let mut sorted_launchers: Vec<String> = selected_launchers.iter().cloned().collect();
         sorted_launchers.sort();
@@ -1103,6 +1189,13 @@ impl SetupCommands {
                 launcher_type,
                 &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
                 &ctx.config.recommended_configs,
+            );
+            recommended_capability_types_by_launcher.insert(
+                launcher_type.clone(),
+                effective_caps
+                    .iter()
+                    .map(|c| c.capability.clone())
+                    .collect(),
             );
 
             for rec_cap in &effective_caps {
@@ -1167,6 +1260,7 @@ impl SetupCommands {
             &selected_models,
             &selected_variants,
             &resolved_capability_models,
+            &recommended_capability_types_by_launcher,
         )
         .await?;
 
@@ -1626,6 +1720,14 @@ impl SetupCommands {
         selected_models: &HashSet<String>,
         selected_variants: &HashMap<String, ModelVariant>,
         resolved_capability_models: &HashMap<String, HashMap<String, String>>,
+        // launcher_type -> capability_types that launcher's own effective
+        // recommended config lists. A capability_type absent from every
+        // launcher's set here has no curated opinion anywhere, so the old
+        // purely-binding-type-based enable behavior still applies to it
+        // (preserves e.g. the wizard's manual-override capabilities); a
+        // capability_type present for *some* launcher but not this one must
+        // NOT be enabled here even if the binding type matches.
+        recommended_capability_types_by_launcher: &HashMap<String, HashSet<String>>,
     ) -> Result<()> {
         let ui = &*ctx.ui;
 
@@ -1807,10 +1909,26 @@ impl SetupCommands {
             }
         }
 
+        // Every capability_type recommended for *some* selected launcher --
+        // used below to tell "not recommended for this launcher because no
+        // one has an opinion on it" (old, purely binding-type-based
+        // behavior still applies) apart from "not recommended for this
+        // launcher because it's recommended for a *different* one instead"
+        // (must NOT be enabled here, even though the binding type matches --
+        // this is exactly the issue #129 follow-up bug: `agent-model` being
+        // a valid recommendation for e.g. `goose` must not make it land on
+        // `claude` too, just because claude's launcher metadata also
+        // supports the `AgentModel` binding).
+        let recommended_anywhere: HashSet<&String> = recommended_capability_types_by_launcher
+            .values()
+            .flatten()
+            .collect();
+
         // Enable every configured capability on each configured launcher
-        // that supports it. Must run after both loops above, since it needs
-        // a live `CapabilitySource` built from the now-populated capability
-        // configs.
+        // that supports it AND either recommends it specifically or has no
+        // curated opinion on it at all. Must run after both loops above,
+        // since it needs a live `CapabilitySource` built from the
+        // now-populated capability configs.
         let capability_source = crate::capabilities::CapabilitySource::from_config(&ctx.config);
         for launcher_id in selected_launchers {
             let Some(launcher_type) = ctx
@@ -1823,14 +1941,21 @@ impl SetupCommands {
             let Some(launcher_meta) = LAUNCHER_REGISTRY.get(&launcher_type) else {
                 continue;
             };
+            let recommended_for_this = recommended_capability_types_by_launcher
+                .get(&launcher_type)
+                .cloned()
+                .unwrap_or_default();
 
             let mut enabled: Vec<String> = capability_source
                 .instances()
                 .into_iter()
-                .filter(|(_, cap)| {
-                    cap.binding_types()
+                .filter(|(id, cap)| {
+                    let binding_ok = cap
+                        .binding_types()
                         .iter()
-                        .any(|bt| launcher_meta.supported_capabilities.contains(bt))
+                        .any(|bt| launcher_meta.supported_capabilities.contains(bt));
+                    binding_ok
+                        && (recommended_for_this.contains(id) || !recommended_anywhere.contains(id))
                 })
                 .map(|(id, _)| id)
                 .collect();
@@ -2851,6 +2976,7 @@ mod tests {
             &selected_models,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -2870,6 +2996,71 @@ mod tests {
         assert!(
             bob_enabled.is_empty(),
             "bob only supports the Mcp binding, so agent-model must not be enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_all_does_not_enable_a_capability_on_a_launcher_that_does_not_recommend_it() {
+        // Regression test: a capability recommended for one launcher must
+        // not be enabled on a *different* selected launcher just because
+        // both happen to support the same binding type. Both "claude" and
+        // "goose" support the AgentModel binding, but only "goose" is given
+        // as recommending "agent-model" here -- "claude" must not get it,
+        // even though the old purely-binding-type-based enable logic would
+        // have put it there too.
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let discovery = run_discovery(&ctx).await;
+
+        let selected_caps: HashSet<String> = ["agent-model".to_string()].into_iter().collect();
+        let selected_launchers: HashSet<String> = ["claude".to_string(), "goose".to_string()]
+            .into_iter()
+            .collect();
+        let selected_providers: HashSet<String> = ["ollama".to_string()].into_iter().collect();
+        let selected_models: HashSet<String> = ["granite-3.1-8b-instruct".to_string()]
+            .into_iter()
+            .collect();
+        let recommended_capability_types_by_launcher: HashMap<String, HashSet<String>> = [(
+            "goose".to_string(),
+            ["agent-model".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &selected_caps,
+            &selected_launchers,
+            &selected_providers,
+            &selected_models,
+            &HashMap::new(),
+            &HashMap::new(),
+            &recommended_capability_types_by_launcher,
+        )
+        .await
+        .unwrap();
+
+        let goose_enabled = &ctx
+            .config
+            .get_launcher("goose")
+            .unwrap()
+            .enabled_capabilities;
+        assert_eq!(
+            goose_enabled,
+            &vec!["agent-model".to_string()],
+            "goose recommends agent-model, so it should be enabled"
+        );
+
+        let claude_enabled = &ctx
+            .config
+            .get_launcher("claude")
+            .unwrap()
+            .enabled_capabilities;
+        assert!(
+            claude_enabled.is_empty(),
+            "claude does not recommend agent-model (goose does), so it must not be enabled \
+             on claude even though claude also supports the AgentModel binding: {claude_enabled:?}"
         );
     }
 
@@ -3083,10 +3274,12 @@ mod tests {
         // second is 4.2-8b (will fit)
         let rec_30b = recommended_config::RecommendedModel {
             model: recommended_config::StringMatch::Exact("granite-4.2-30b".to_string()),
+            variant_formats: vec![],
             variant_precisions: vec![],
         };
         let rec_8b = recommended_config::RecommendedModel {
             model: recommended_config::StringMatch::Exact("granite-4.2-8b".to_string()),
+            variant_formats: vec![],
             variant_precisions: vec![],
         };
         let set = recommended_config::RecommendedModelSet {
@@ -3121,6 +3314,7 @@ mod tests {
         // are in the allow-list
         let rec = recommended_config::RecommendedModel {
             model: recommended_config::StringMatch::Exact("granite-3.1-8b-instruct".to_string()),
+            variant_formats: vec![],
             variant_precisions: vec![
                 recommended_config::StringMatch::Exact("Q4_K_M".to_string()),
                 recommended_config::StringMatch::Exact("Q5_K_M".to_string()),
@@ -3163,6 +3357,7 @@ mod tests {
 
         let rec = recommended_config::RecommendedModel {
             model: recommended_config::StringMatch::Exact("granite-3.1-8b-instruct".to_string()),
+            variant_formats: vec![],
             variant_precisions: vec![],
         };
         // min_context_length of 100_000 is very high; with 4GB RAM the
@@ -3198,6 +3393,7 @@ mod tests {
                     model: recommended_config::StringMatch::Exact(
                         "granite-3.1-8b-instruct".to_string(),
                     ),
+                    variant_formats: vec![],
                     variant_precisions: vec![],
                 }],
             },
@@ -3217,26 +3413,184 @@ mod tests {
     // -- Regression test: issue #129 bug ---------------------------------------
 
     #[test]
-    fn claude_agent_model_resolution_never_picks_a_3b_class_model() {
-        // Regression test for issue #129: `claude` was getting wired to a
+    fn resolve_model_set_falls_through_when_the_top_ranked_variant_is_unrunnable() {
+        // Regression test: granite-4.2-3b's variant list contains a
+        // "safetensors"/bfloat16 build that ties GGUF quantized builds on
+        // ContextFit (both fully fit tiny models on generous hardware), and
+        // the fit/size tie-break in `rank_variants_among` prefers the larger
+        // one -- so the *top-ranked* variant among an allow-list spanning
+        // both is the safetensors build. Ollama can only run GGUF/Ollama
+        // formats, so if `resolve_model_set` only ever tried the single
+        // best-ranked variant, this would fail to resolve even though a
+        // perfectly good GGUF variant is right there in the same allow-list.
+        // This is exactly what caused `sub-agent-explore` to silently not
+        // get enabled under `setup --auto`.
+        let hardware = test_hardware_profile();
+        let ctx = test_ctx();
+        let healthy = vec!["ollama".to_string()];
+
+        let rec = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-4.2-3b".to_string()),
+            variant_formats: vec![],
+            variant_precisions: vec![
+                recommended_config::StringMatch::Exact("Q4_K_M".to_string()),
+                recommended_config::StringMatch::Exact("Q5_K_M".to_string()),
+                recommended_config::StringMatch::Exact("Q6_K".to_string()),
+                recommended_config::StringMatch::Exact("Q8_0".to_string()),
+                recommended_config::StringMatch::Exact("bfloat16".to_string()),
+            ],
+        };
+        let set = recommended_config::RecommendedModelSet {
+            min_context_length: Some(65536),
+            models: vec![rec],
+        };
+
+        let result = resolve_model_set(&set, &hardware, &healthy, &ctx);
+        let (model_id, variant) = result.expect(
+            "should fall through to a GGUF-runnable variant instead of giving up on the \
+             unrunnable safetensors one",
+        );
+        assert_eq!(model_id, "granite-4.2-3b");
+        assert!(
+            variant.format.eq_ignore_ascii_case("gguf")
+                || variant.format.eq_ignore_ascii_case("ollama"),
+            "expected a variant Ollama can actually run, got format '{}'",
+            variant.format
+        );
+    }
+
+    #[test]
+    fn resolve_model_set_variant_formats_filters_by_format() {
+        // "just use the Ollama-served build" -- a format-only constraint
+        // with no precision restriction should admit any Ollama-format
+        // variant and reject everything else.
+        let hardware = test_hardware_profile();
+        let ctx = test_ctx();
+        let healthy = vec!["ollama".to_string()];
+
+        let rec = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-4.2-3b".to_string()),
+            variant_formats: vec![recommended_config::StringMatch::Exact("Ollama".to_string())],
+            variant_precisions: vec![],
+        };
+        let set = recommended_config::RecommendedModelSet {
+            min_context_length: None,
+            models: vec![rec],
+        };
+
+        let (model_id, variant) =
+            resolve_model_set(&set, &hardware, &healthy, &ctx).expect("should resolve");
+        assert_eq!(model_id, "granite-4.2-3b");
+        assert!(
+            variant.format.eq_ignore_ascii_case("ollama"),
+            "expected the Ollama-format variant, got '{}'",
+            variant.format
+        );
+    }
+
+    #[test]
+    fn resolve_model_set_variant_formats_and_precisions_combine_with_and() {
+        // GGUF-only, Q4_K_M-or-better: a safetensors variant must not be
+        // admitted even though its precision string ("bfloat16") isn't in
+        // the precision list either -- and a GGUF variant outside the
+        // precision allow-list (e.g. Q2_K) must also be excluded.
+        let hardware = test_hardware_profile();
+        let ctx = test_ctx();
+        let healthy = vec!["ollama".to_string()];
+
+        let rec = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-4.2-3b".to_string()),
+            variant_formats: vec![recommended_config::StringMatch::Exact("GGUF".to_string())],
+            variant_precisions: vec![
+                recommended_config::StringMatch::Exact("Q4_K_M".to_string()),
+                recommended_config::StringMatch::Exact("Q5_K_M".to_string()),
+            ],
+        };
+        let set = recommended_config::RecommendedModelSet {
+            min_context_length: None,
+            models: vec![rec],
+        };
+
+        let (model_id, variant) =
+            resolve_model_set(&set, &hardware, &healthy, &ctx).expect("should resolve");
+        assert_eq!(model_id, "granite-4.2-3b");
+        assert!(variant.format.eq_ignore_ascii_case("gguf"));
+        assert!(variant.precision == "Q4_K_M" || variant.precision == "Q5_K_M");
+    }
+
+    #[test]
+    fn wildcard_agent_model_resolution_never_picks_a_3b_class_model() {
+        // Regression test for issue #129: a launcher was getting wired to a
         // 3B model because the generic `ModelRequirement` only checks
         // Chat+ToolCalling (which a 3B model satisfies) and selection among
         // qualifying models was nondeterministic (`HashSet` iteration
         // order).
         //
         // This exercises the *real*, shipped `resources/recommended_configs/
-        // claude.yaml` data through the real resolution path
+        // default.yaml` data through the real resolution path
         // (`effective_capabilities` + `resolve_capability`), deliberately
         // bypassing `Discover::run`/`run_auto_with_hardware` -- going
         // through the full pipeline would make this test depend on whether
-        // the `claude` binary happens to be on the test runner's PATH (for
-        // launcher detection) and would skip provider health-probing
-        // entirely for an already-configured provider, either of which lets
-        // the test pass vacuously (nothing resolves, so nothing is ever a
-        // 3B model) without actually exercising the fix. Driving
-        // `resolve_capability` directly, with an explicit `healthy` provider
-        // list, makes the check deterministic and environment-independent
-        // while still using the real production data and algorithm.
+        // some real launcher binary happens to be on the test runner's PATH
+        // and would skip provider health-probing entirely for an
+        // already-configured provider, either of which lets the test pass
+        // vacuously (nothing resolves, so nothing is ever a 3B model)
+        // without actually exercising the fix. Driving `resolve_capability`
+        // directly, with an explicit `healthy` provider list, makes the
+        // check deterministic and environment-independent while still using
+        // the real production data and algorithm.
+        //
+        // Uses "goose" -- a real `LAUNCHER_REGISTRY` entry that supports
+        // `AgentModel` but has no `resources/recommended_configs/goose.yaml`
+        // of its own, so its effective config comes entirely from the
+        // wildcard (per the "a launcher's own entry is authoritative;
+        // otherwise fall back to the wildcard" rule).
+        let hardware = test_hardware_profile();
+        let ctx = test_ctx();
+        let healthy = vec!["ollama".to_string()];
+
+        let rec_caps = recommended_config::effective_capabilities(
+            "goose",
+            &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+            &HashMap::new(),
+        );
+        let agent_model_cap = rec_caps
+            .iter()
+            .find(|c| c.capability == "agent-model")
+            .expect("goose has no config of its own, so it should inherit agent-model from the wildcard");
+
+        let resolved =
+            resolve_capability("agent-model", agent_model_cap, &hardware, &healthy, &ctx)
+                .expect("agent-model should resolve for goose given a healthy ollama provider");
+
+        let (model_id, _variant) = resolved
+            .slots
+            .get("model_id")
+            .expect("model_id slot should have resolved");
+
+        assert!(
+            !model_id.contains("3b") || model_id.contains("30b"),
+            "bug #129: agent-model resolved to a 3B-class model: {model_id}"
+        );
+        // Positive check: it actually is one of the real granite-4.x
+        // candidates, not just "something that isn't 3b".
+        assert!(
+            model_id.starts_with("granite-4."),
+            "expected a granite-4.x candidate, got '{model_id}'"
+        );
+    }
+
+    #[test]
+    fn claude_sub_agent_explore_resolves_against_the_real_shipped_config() {
+        // End-to-end regression check against the real, shipped
+        // resources/recommended_configs/claude.yaml data (not synthetic
+        // test fixtures): claude's sub-agent-explore recommendation
+        // (granite-4.2-3b, precisions spanning both quantized GGUF and a
+        // raw safetensors build) must actually resolve. Before the
+        // resolve_model_set fix, it silently failed to enable at all,
+        // because the top-ranked variant by fit/size happened to be the
+        // unrunnable safetensors build and resolution gave up rather than
+        // falling through to a GGUF one.
         let hardware = test_hardware_profile();
         let ctx = test_ctx();
         let healthy = vec!["ollama".to_string()];
@@ -3246,29 +3600,23 @@ mod tests {
             &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
             &HashMap::new(),
         );
-        let agent_model_cap = rec_caps
+        let cap = rec_caps
             .iter()
-            .find(|c| c.capability == "agent-model")
-            .expect("claude.yaml defines an agent-model recommendation");
+            .find(|c| c.capability == "sub-agent-explore")
+            .expect("claude.yaml defines sub-agent-explore");
 
-        let resolved =
-            resolve_capability("agent-model", agent_model_cap, &hardware, &healthy, &ctx)
-                .expect("agent-model should resolve for claude given a healthy ollama provider");
-
-        let (model_id, _variant) = resolved
+        let resolved = resolve_capability("sub-agent-explore", cap, &hardware, &healthy, &ctx)
+            .expect("sub-agent-explore should resolve for claude given a healthy ollama provider");
+        let (model_id, variant) = resolved
             .slots
             .get("model_id")
             .expect("model_id slot should have resolved");
-
+        assert_eq!(model_id, "granite-4.2-3b");
         assert!(
-            !model_id.contains("3b") || model_id.contains("30b"),
-            "bug #129: claude's agent-model resolved to a 3B-class model: {model_id}"
-        );
-        // Positive check: it actually is one of claude.yaml's real granite-4.x
-        // candidates, not just "something that isn't 3b".
-        assert!(
-            model_id.starts_with("granite-4."),
-            "expected a granite-4.x candidate from claude.yaml, got '{model_id}'"
+            variant.format.eq_ignore_ascii_case("gguf")
+                || variant.format.eq_ignore_ascii_case("ollama"),
+            "expected a variant Ollama can actually run, got format '{}'",
+            variant.format
         );
     }
 }
