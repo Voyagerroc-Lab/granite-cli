@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use_channel!("CONF");
 
+pub(crate) mod recommended_config;
 pub(crate) mod validation;
 
 const PATH_DELIM: &str = "---";
@@ -42,12 +43,25 @@ impl ConfigId for LauncherConfig {
     }
 }
 
+impl ConfigId for recommended_config::RecommendedConfiguration {
+    fn config_id(&self) -> &str {
+        &self.launcher
+    }
+}
+
+impl ConfigPathTranslator for recommended_config::RecommendedConfiguration {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     pub providers: HashMap<String, ProviderConfig>,
     pub capabilities: HashMap<String, CapabilityConfig>,
     pub launchers: HashMap<String, LauncherConfig>,
+    pub recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
     /// Ephemeral handle to the session-scoped model proxy for the current
     /// `launch` invocation, set whenever `-u`/`--usage-tracking` is enabled
     /// or a bound capability needs sub-agent routing. Never persisted --
@@ -367,6 +381,10 @@ impl Config {
         Ok(Self::config_dir()?.join("launchers"))
     }
 
+    fn recommended_configs_dir() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("recommended_configs"))
+    }
+
     /// Directory a launcher may materialize generated state into -- config files
     /// it must put on disk for the tool it wraps. Kept under `GRANITE_CLI_HOME`
     /// so wrapping a tool never means editing that tool's own global config.
@@ -389,6 +407,7 @@ impl Config {
         fs::create_dir_all(Self::providers_dir()?)?;
         fs::create_dir_all(Self::capabilities_dir()?)?;
         fs::create_dir_all(Self::launchers_dir()?)?;
+        fs::create_dir_all(Self::recommended_configs_dir()?)?;
         Ok(())
     }
 
@@ -460,6 +479,7 @@ impl Config {
         let providers_dir = &Self::providers_dir()?;
         let capabilities_dir = &Self::capabilities_dir()?;
         let launchers_dir = &Self::launchers_dir()?;
+        let recommended_configs_dir = &Self::recommended_configs_dir()?;
         alog_channel!(MessageLevel::Debug, "Models Dir: {:#?}", models_dir);
         alog_channel!(MessageLevel::Debug, "Providers Dir: {:#?}", providers_dir);
         alog_channel!(
@@ -468,10 +488,16 @@ impl Config {
             capabilities_dir
         );
         alog_channel!(MessageLevel::Debug, "Launchers Dir: {:#?}", launchers_dir);
+        alog_channel!(
+            MessageLevel::Debug,
+            "RecommendedConfigs Dir: {:#?}",
+            recommended_configs_dir
+        );
         config.models = Self::load_dir(models_dir, |s| s.to_string())?;
         config.providers = Self::load_dir(providers_dir, |s| s.to_string())?;
         config.capabilities = Self::load_dir(capabilities_dir, |s| s.to_string())?;
         config.launchers = Self::load_dir(launchers_dir, |s| s.to_string())?;
+        config.recommended_configs = Self::load_dir(recommended_configs_dir, |s| s.to_string())?;
 
         Ok(config)
     }
@@ -807,5 +833,49 @@ mod tests {
 
         config.remove_launcher("claude").unwrap();
         assert!(config.get_launcher("claude").is_none());
+    }
+
+    #[test]
+    fn recommended_config_loads_from_directory() {
+        let _home = TestConfigHome::new();
+
+        // Drop a YAML file into the recommended_configs directory
+        let rc_dir =
+            Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("recommended_configs");
+        fs::create_dir_all(&rc_dir).unwrap();
+        fs::write(
+            rc_dir.join("claude.yaml"),
+            "launcher: claude\ncapabilities:\n  - capability: agent-model\n    models:\n      model_id:\n        min_context_length: ~\n        models:\n          - model: \"claude-sonnet-4-20250514\"\n            variant_precisions: []\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+        assert!(config.recommended_configs.contains_key("claude"));
+        let rc = config.recommended_configs.get("claude").unwrap();
+        assert_eq!(rc.launcher, "claude");
+        assert_eq!(rc.capabilities.len(), 1);
+        assert_eq!(rc.capabilities[0].capability, "agent-model");
+    }
+
+    #[test]
+    fn recommended_config_mismatched_id_is_ignored() {
+        let _home = TestConfigHome::new();
+
+        // Write a file whose launcher id does not match its filename
+        let rc_dir =
+            Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("recommended_configs");
+        fs::create_dir_all(&rc_dir).unwrap();
+        // Filename is "other.yaml" but the launcher field says "claude"
+        fs::write(
+            rc_dir.join("other.yaml"),
+            "launcher: claude\ncapabilities: []\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+        // "claude" key should NOT be present because the filename was "other"
+        assert!(!config.recommended_configs.contains_key("claude"));
+        // "other" key should NOT be present either -- mismatched configs are skipped
+        assert!(!config.recommended_configs.contains_key("other"));
     }
 }
