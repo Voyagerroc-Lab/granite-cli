@@ -1,10 +1,10 @@
-# Recommended configuration for the `claude` launcher.
+# Default (wildcard) recommended configuration: applies to every launcher
+# without its own more-specific file.
 
-launcher: "claude"
+launcher: "*"
 
 capabilities:
-
-  - capability: sub-agent-code
+  - capability: agent-model
     models:
       model_id:
         min_context_length: 65536
@@ -16,32 +16,12 @@ capabilities:
               - Q6_K
               - Q8_0
               - bfloat16
-
-  - capability: sub-agent-explore
-    models:
-      model_id:
-        min_context_length: 65536
-        models:
-          - model: granite-4.2-3b
+          - model: granite-4.2-8b
             variant_precisions:
               - Q4_K_M
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - bfloat16
-
-  - capability: sub-agent-plan
-    models:
-      model_id:
-        min_context_length: 65536
-        models:
-          - model: granite-4.2-30b
-            variant_precisions:
-              - Q4_K_M
-              - Q5_K_M
-              - Q6_K
-              - Q8_0
-              - BF16
               - bfloat16
 
   - capability: vision-mcp
@@ -55,4 +35,3 @@ capabilities:
               - Q5_K_M
               - Q6_K
               - Q8_0
-              - BF16

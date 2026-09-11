@@ -1,8 +1,24 @@
-# Recommended configuration for the `claude` launcher.
+# Recommended configuration for the `opencode` launcher.
+# Identical to claude.yaml because opencode supports the same set of
+# capabilities (AgentModel, Mcp, SubAgent).
 
-launcher: "claude"
+launcher: "opencode"
 
 capabilities:
+  - capability: agent-model
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-30b
+            variant_precisions:
+              - OpenRouter
+              - Ollama
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+              - safetensors
 
   - capability: sub-agent-code
     models:
