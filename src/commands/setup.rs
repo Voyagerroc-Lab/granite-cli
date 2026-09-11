@@ -8,6 +8,7 @@ use anyhow::Result;
 // Local
 use crate::capabilities::{BindingType, CAPABILITY_REGISTRY, Dependency, ModelRequirement};
 use crate::commands::model::ModelCommands;
+use crate::config::recommended_config;
 use crate::dependency::{Configured, Requirement};
 use crate::launchers::LAUNCHER_REGISTRY;
 use crate::models::{
@@ -659,20 +660,40 @@ fn best_variant(
     model: &ModelMetadata,
     profile: &crate::utils::hardware::HardwareProfile,
 ) -> Option<(ModelVariant, ContextFit)> {
+    best_variant_among(
+        model.variants.iter(),
+        model.context_length,
+        &model.architecture,
+        &model.native_dtype,
+        profile,
+    )
+}
+
+/// Rank an iterator of variants by hardware fit (best first).
+/// `context_length` / `architecture` / `native_dtype` are used to compute
+/// ContextFit for every variant; `profile` is the machine profile.
+///
+/// Returns the single best variant (highest fit rank, then smallest size as
+/// tie-break) together with its ContextFit, or None if nothing fits.
+fn best_variant_among<'a>(
+    variants: impl Iterator<Item = &'a ModelVariant>,
+    context_length: u64,
+    architecture: &crate::models::ModelArchitecture,
+    native_dtype: &str,
+    profile: &crate::utils::hardware::HardwareProfile,
+) -> Option<(ModelVariant, ContextFit)> {
     let fit_rank = |fit: &ContextFit| match fit {
         ContextFit::Full => 1,
         ContextFit::Partial(_) => 0,
         ContextFit::None => -1,
     };
 
-    model
-        .variants
-        .iter()
+    variants
         .map(|v| {
             let fit = crate::models::context_fit::estimate(
-                model.context_length,
-                &model.architecture,
-                &model.native_dtype,
+                context_length,
+                architecture,
+                native_dtype,
                 v,
                 profile,
             );
@@ -745,6 +766,171 @@ const MULTIMODAL_FUNCTIONS: &[ModelFunction] = &[
     ModelFunction::KeywordBiasing,
 ];
 
+/// Given a `StringMatch`, return the sorted list of catalog model ids that
+/// match. `Exact` resolves to at most one id; `Regex` resolves to every
+/// matching registered id (sorted for determinism).
+fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
+    match m {
+        recommended_config::StringMatch::Exact(id) => {
+            if MODEL_REGISTRY.get(id).is_some() {
+                vec![id.clone()]
+            } else {
+                vec![]
+            }
+        }
+        recommended_config::StringMatch::Regex { regex: _pattern } => {
+            let mut matches: Vec<String> = MODEL_REGISTRY
+                .entries()
+                .keys()
+                .filter(|k| m.matches(k))
+                .map(|s| s.to_string())
+                .collect();
+            matches.sort();
+            matches
+        }
+    }
+}
+
+/// Check whether a healthy (discoverable) provider type can run a given
+/// variant. Constructs a transient instance with the registry's default
+/// config and calls `can_run_model`, mirroring the pattern used in
+/// `find_can_run_providers` / `candidate_variants`.
+fn provider_can_run(provider_type: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
+    let default_config = PROVIDER_REGISTRY
+        .default_config(provider_type)
+        .unwrap_or_default();
+    PROVIDER_REGISTRY
+        .construct(provider_type, provider_type, &default_config, &ctx.config)
+        .ok()
+        .is_some_and(|p| p.can_run_model(&variant.format, &variant.precision))
+}
+
+/// One capability's resolution against its `RecommendedCapability`: which
+/// model+variant fills each of the capability's `Dependency::Model` config_key
+/// slots. Only present when every *required* slot resolved.
+struct ResolvedCapability {
+    capability_type: String,
+    /// config_key -> (model_id, variant)
+    slots: HashMap<String, (String, ModelVariant)>,
+}
+
+/// Resolve one capability's model slots against a `RecommendedCapability`.
+/// Looks up the capability's `CAPABILITY_REGISTRY` metadata for its
+/// `Dependency::Model` requirements, then tries each candidate in the
+/// recommended set until one fully resolves.
+fn resolve_capability(
+    cap_type: &str,
+    rec_cap: &recommended_config::RecommendedCapability,
+    hardware: &crate::utils::hardware::HardwareProfile,
+    healthy_provider_types: &[String],
+    ctx: &crate::AppContext,
+) -> Option<ResolvedCapability> {
+    let cap_meta = CAPABILITY_REGISTRY.get(cap_type)?;
+
+    let mut result = ResolvedCapability {
+        capability_type: cap_type.to_string(),
+        slots: HashMap::new(),
+    };
+
+    for dep in &cap_meta.dependencies {
+        let Dependency::Model {
+            config_key,
+            required,
+            ..
+        } = dep
+        else {
+            continue; // Provider / ExternalTool -- irrelevant for resolution
+        };
+
+        // Look up the recommended model set for this config_key slot
+        let rec_model_set = match rec_cap.models.get(config_key.as_str()) {
+            Some(set) => set,
+            None => {
+                if *required {
+                    return None; // Required slot has no recommendation -> whole capability fails
+                }
+                continue; // Not required, leave unset
+            }
+        };
+
+        // Resolve this slot against the recommended model set
+        match resolve_model_set(rec_model_set, hardware, healthy_provider_types, ctx) {
+            Some((model_id, variant)) => {
+                result.slots.insert(config_key.clone(), (model_id, variant));
+            }
+            None => {
+                if *required {
+                    return None;
+                }
+                // Not required, leave unset
+            }
+        }
+    }
+
+    Some(result)
+}
+
+/// Resolve a single `RecommendedModelSet` to a concrete `(model_id, variant)`
+/// pair. Tries candidates in declared order (first-match-wins semantics).
+fn resolve_model_set(
+    set: &recommended_config::RecommendedModelSet,
+    hardware: &crate::utils::hardware::HardwareProfile,
+    healthy_provider_types: &[String],
+    ctx: &crate::AppContext,
+) -> Option<(String, ModelVariant)> {
+    for rec_model in &set.models {
+        // Resolve the model match to actual catalog ids
+        let catalog_ids = matching_catalog_ids(&rec_model.model);
+        for model_id in catalog_ids {
+            let md = match MODEL_REGISTRY.get(&model_id) {
+                Some(md) => md,
+                None => continue,
+            };
+
+            // Filter variants by precision allow-list, then pick the best fit
+            let best = best_variant_among(
+                md.variants.iter().filter(|v| {
+                    rec_model.variant_precisions.is_empty()
+                        || rec_model
+                            .variant_precisions
+                            .iter()
+                            .any(|p| p.matches(&v.precision))
+                }),
+                md.context_length,
+                &md.architecture,
+                &md.native_dtype,
+                hardware,
+            );
+
+            if let Some((variant, fit)) = best {
+                // Compute effective context length from the fit
+                let effective_context = match fit {
+                    ContextFit::Full => md.context_length,
+                    ContextFit::Partial(n) => n,
+                    ContextFit::None => continue, // Already excluded by best_variant_among
+                };
+
+                // Check min_context_length gate (against effective, not native)
+                if effective_context < set.min_context_length.unwrap_or(0) {
+                    continue;
+                }
+
+                // Check that at least one healthy provider type can run this variant
+                if !healthy_provider_types
+                    .iter()
+                    .any(|pt| provider_can_run(pt, &variant, ctx))
+                {
+                    continue;
+                }
+
+                return Some((model_id, variant));
+            }
+        }
+    }
+
+    None
+}
+
 /// Whether `md` should be recommended for a capability declaring `req`.
 /// Layers an extra rule on top of `ModelRequirement::admits_type`: if `req`
 /// doesn't itself ask for any multi-modal function, a multi-modal model is
@@ -808,7 +994,8 @@ impl SetupCommands {
         let selected_caps = Self::select_capabilities(ctx, &discovery, &selected_launchers).await?;
 
         // Phase 3: Models selection (filtered by capability requirements)
-        let selected_models = Self::select_models(ctx, &discovery, &selected_caps).await?;
+        let selected_models =
+            Self::select_models(ctx, &discovery, &selected_caps, &selected_launchers).await?;
 
         // Phase 4: Providers selection (only healthy, filtered by model compatibility)
         let selected_providers = Self::select_providers(ctx, &discovery, &selected_models).await?;
@@ -827,6 +1014,7 @@ impl SetupCommands {
             &selected_providers,
             &selected_models,
             &selected_variants,
+            &HashMap::new(),
         )
         .await?;
 
@@ -849,11 +1037,19 @@ impl SetupCommands {
 
     /// Run auto mode — detect, configure everything with defaults.
     async fn run_auto(ctx: &mut crate::AppContext) -> Result<()> {
+        Self::run_auto_with_hardware(ctx, &detect_hardware()).await
+    }
+
+    /// Hardware-aware variant of `run_auto` for testability.
+    async fn run_auto_with_hardware(
+        ctx: &mut crate::AppContext,
+        hardware: &crate::utils::hardware::HardwareProfile,
+    ) -> Result<()> {
         let ui = &*ctx.ui;
         ui.info("=== granite-cli Auto Setup ===\n");
         ui.info("Auto-detecting and configuring all available components...\n");
 
-        let discovery = Discover::run(ctx).await;
+        let discovery = Discover::run_with_hardware(ctx, hardware).await;
 
         if discovery.recommendations.is_empty() {
             ui.info("No components available to configure.");
@@ -876,38 +1072,88 @@ impl SetupCommands {
             })
             .collect();
 
-        let selected_caps: HashSet<String> =
-            Revaluator::for_capabilities(&discovery, &selected_launchers)
-                .into_iter()
-                .filter_map(|r| match r {
-                    Recommendation::Capability {
-                        capability_type, ..
-                    } => Some(capability_type.clone()),
-                    _ => None,
-                })
-                .collect();
+        // Compute healthy provider types from discovery recommendations
+        let healthy_provider_types: Vec<String> = discovery
+            .recommendations
+            .iter()
+            .filter_map(|r| match r {
+                Recommendation::Provider {
+                    provider_type,
+                    health_healthy: true,
+                    ..
+                } => Some(provider_type.to_string()),
+                _ => None,
+            })
+            .collect();
 
-        let selected_models: HashSet<String> =
-            Revaluator::for_models(&discovery.recommendations, &selected_caps)
-                .into_iter()
-                .filter_map(|r| match r {
-                    Recommendation::Model { model_id, .. } => Some(model_id.clone()),
-                    _ => None,
-                })
-                .collect();
+        // Iterate launchers in sorted order for determinism, resolving
+        // capabilities via the recommended config system.
+        let mut selected_caps: HashSet<String> = HashSet::new();
+        let mut selected_models: HashSet<String> = HashSet::new();
+        let mut selected_variants: HashMap<String, ModelVariant> = HashMap::new();
+        let mut selected_providers: HashSet<String> = HashSet::new();
+        let mut resolved_capability_models: HashMap<String, HashMap<String, String>> =
+            HashMap::new();
 
-        let selected_providers: HashSet<String> =
-            Revaluator::for_providers(&discovery, &selected_models, ctx)
-                .into_iter()
-                .filter_map(|r| match r {
-                    Recommendation::Provider {
-                        provider_type,
-                        health_healthy,
-                        ..
-                    } if *health_healthy => Some(provider_type.to_string()),
-                    _ => None,
-                })
-                .collect();
+        let mut sorted_launchers: Vec<String> = selected_launchers.iter().cloned().collect();
+        sorted_launchers.sort();
+
+        for launcher_type in &sorted_launchers {
+            let effective_caps = recommended_config::effective_capabilities(
+                launcher_type,
+                &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+                &ctx.config.recommended_configs,
+            );
+
+            for rec_cap in &effective_caps {
+                if let Some(resolved) = resolve_capability(
+                    &rec_cap.capability,
+                    rec_cap,
+                    hardware,
+                    &healthy_provider_types,
+                    ctx,
+                ) {
+                    selected_caps.insert(resolved.capability_type.clone());
+                    for (config_key, (model_id, variant)) in resolved.slots {
+                        // Check for conflict from an earlier launcher in the
+                        // sorted iteration
+                        if let Some(cap_slots) =
+                            resolved_capability_models.get(&resolved.capability_type)
+                            && let Some(existing_model) = cap_slots.get(&config_key)
+                            && existing_model != &model_id
+                        {
+                            ui.warn(&format!(
+                                "Capability '{}' config_key '{}' has a conflicting \
+                                 recommendation between launchers '{}': keeping '{}', \
+                                 ignoring '{}'.",
+                                resolved.capability_type,
+                                config_key,
+                                launcher_type,
+                                existing_model,
+                                model_id
+                            ));
+                            continue;
+                        }
+                        resolved_capability_models
+                            .entry(resolved.capability_type.clone())
+                            .or_default()
+                            .insert(config_key.clone(), model_id.clone());
+                        selected_models.insert(model_id.clone());
+                        selected_variants.insert(model_id, variant);
+                    }
+                }
+            }
+        }
+
+        // Select every healthy provider type; `configure_all`'s
+        // `find_compatible_provider` picks the actually-compatible one per
+        // model once providers are written to config (mirrors how the
+        // previous `Revaluator::for_providers`-based selection worked, since
+        // can_run_by is always empty pre-configuration on a first-time
+        // setup).
+        for provider_type in &healthy_provider_types {
+            selected_providers.insert(provider_type.clone());
+        }
 
         // --auto is non-interactive, so there's no prompt for variant
         // selection -- `configure_all` falls back to discovery's
@@ -919,7 +1165,8 @@ impl SetupCommands {
             &selected_launchers,
             &selected_providers,
             &selected_models,
-            &HashMap::new(),
+            &selected_variants,
+            &resolved_capability_models,
         )
         .await?;
 
@@ -944,7 +1191,8 @@ impl SetupCommands {
     ) -> Result<HashSet<String>> {
         let ui = &*ctx.ui;
 
-        let caps: Vec<_> = Revaluator::for_capabilities(discovery, selected_launchers)
+        // Get the base set from Revaluator (launcher-compatibility filter)
+        let all_caps: Vec<_> = Revaluator::for_capabilities(discovery, selected_launchers)
             .into_iter()
             .filter_map(|r| match r {
                 Recommendation::Capability {
@@ -954,6 +1202,29 @@ impl SetupCommands {
                 _ => None,
             })
             .collect();
+
+        // Intersect with recommended capabilities from effective_capabilities
+        let recommended_cap_types: HashSet<String> = selected_launchers
+            .iter()
+            .flat_map(|launcher_type| {
+                recommended_config::effective_capabilities(
+                    launcher_type,
+                    &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+                    &ctx.config.recommended_configs,
+                )
+            })
+            .map(|rec_cap| rec_cap.capability.clone())
+            .collect();
+
+        let caps: Vec<_> = if recommended_cap_types.is_empty() {
+            // No recommendations -- show all capabilities (original behavior)
+            all_caps
+        } else {
+            all_caps
+                .into_iter()
+                .filter(|(cap_type, _)| recommended_cap_types.contains(cap_type))
+                .collect()
+        };
 
         if caps.is_empty() {
             ui.info("No capabilities available for the selected launchers.");
@@ -1225,13 +1496,50 @@ impl SetupCommands {
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
         selected_caps: &HashSet<String>,
+        selected_launchers: &HashSet<String>,
     ) -> Result<HashSet<String>> {
         let ui = &*ctx.ui;
 
-        let filtered = Self::model_options(Revaluator::for_models(
-            &discovery.recommendations,
-            selected_caps,
-        ));
+        // Filter the Revaluator output to only include models recommended by
+        // the effective capabilities for the selected launchers.
+        let mut recommended_ids: HashSet<String> = HashSet::new();
+        for launcher_type in selected_launchers {
+            for rec_cap in recommended_config::effective_capabilities(
+                launcher_type,
+                &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+                &ctx.config.recommended_configs,
+            ) {
+                if selected_caps.contains(&rec_cap.capability) {
+                    for set in rec_cap.models.values() {
+                        for m in &set.models {
+                            for id in matching_catalog_ids(&m.model) {
+                                recommended_ids.insert(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let base_models = Revaluator::for_models(&discovery.recommendations, selected_caps);
+        let filtered = if recommended_ids.is_empty() {
+            // No recommendations available -- show all models (original behavior)
+            Self::model_options(base_models)
+        } else {
+            // Intersect with recommended ids
+            Self::model_options(
+                base_models
+                    .into_iter()
+                    .filter(|r| {
+                        if let Recommendation::Model { model_id, .. } = r {
+                            recommended_ids.contains(model_id)
+                        } else {
+                            false
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         let mut chosen: HashSet<String> = HashSet::new();
         let mut choose_different = filtered.is_empty();
@@ -1308,6 +1616,7 @@ impl SetupCommands {
 
     /*-- Configuration phase -------------------------------------------------*/
 
+    #[allow(clippy::too_many_arguments)]
     async fn configure_all(
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
@@ -1316,6 +1625,7 @@ impl SetupCommands {
         selected_providers: &HashSet<String>,
         selected_models: &HashSet<String>,
         selected_variants: &HashMap<String, ModelVariant>,
+        resolved_capability_models: &HashMap<String, HashMap<String, String>>,
     ) -> Result<()> {
         let ui = &*ctx.ui;
 
@@ -1421,17 +1731,48 @@ impl SetupCommands {
 
         // Configure capabilities
         for cap_type in selected_caps {
-            let model_id = Self::find_model_for_capability(cap_type, selected_models);
-
-            // Skip capabilities that have a required model dependency but no
-            // matching model was selected — saving them with model_id="" would
-            // panic when CapabilitySource constructs the instance below.
-            let needs_model = CAPABILITY_REGISTRY.get(cap_type).is_some_and(|meta| {
+            let cap_meta = CAPABILITY_REGISTRY.get(cap_type);
+            let needs_model = cap_meta.as_ref().is_some_and(|meta| {
                 meta.dependencies
                     .iter()
                     .any(|d| matches!(d, Dependency::Model { required: true, .. }))
             });
-            if needs_model && model_id.is_none() {
+
+            // Iterate over the capability's model dependencies and resolve
+            // each one: precise mapping wins when present (from
+            // resolved_capability_models), otherwise fall back to the
+            // existing heuristic via find_model_for_capability.
+            let mut cap_model_ids: HashMap<String, String> = HashMap::new();
+            if let Some(meta) = cap_meta.as_ref() {
+                for dep in &meta.dependencies {
+                    let Dependency::Model {
+                        config_key,
+                        required,
+                        ..
+                    } = dep
+                    else {
+                        continue;
+                    };
+                    let model_id = resolved_capability_models
+                        .get(cap_type)
+                        .and_then(|slots| slots.get(config_key.as_str()).cloned())
+                        .or_else(|| Self::find_model_for_capability(cap_type, selected_models));
+
+                    if let Some(id) = model_id {
+                        cap_model_ids.insert(config_key.clone(), id);
+                    } else if *required {
+                        // A required model dependency has no match -- skip this
+                        // capability to avoid panics in CapabilitySource.
+                        ui.warn(&format!(
+                            "Skipping '{cap_type}': no compatible model available."
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            // Re-check: if we needed a model but found none at all, skip
+            if needs_model && cap_model_ids.is_empty() {
                 ui.warn(&format!(
                     "Skipping '{cap_type}': no compatible model available."
                 ));
@@ -1444,9 +1785,9 @@ impl SetupCommands {
                 .default_config(cap_type)
                 .unwrap_or_default();
 
-            // Set model_id if the capability requires a model
-            if let Some(model_id) = model_id {
-                config["model_id"] = model_id.into();
+            // Set each resolved model dependency slot
+            for (config_key, model_id) in &cap_model_ids {
+                config[config_key.as_str()] = model_id.as_str().into();
             }
 
             let capability_config = crate::config::CapabilityConfig {
@@ -2469,9 +2810,11 @@ mod tests {
             .borrow_mut()
             .push_back(vec![thirty_b_idx]);
 
-        let chosen = SetupCommands::select_models(&mut ctx, &discovery, &selected_caps)
-            .await
-            .unwrap();
+        let selected_launchers: HashSet<String> = HashSet::new();
+        let chosen =
+            SetupCommands::select_models(&mut ctx, &discovery, &selected_caps, &selected_launchers)
+                .await
+                .unwrap();
 
         assert_eq!(
             chosen,
@@ -2506,6 +2849,7 @@ mod tests {
             &selected_launchers,
             &selected_providers,
             &selected_models,
+            &HashMap::new(),
             &HashMap::new(),
         )
         .await
@@ -2688,6 +3032,243 @@ mod tests {
             SetupCommands::find_compatible_provider(&safetensors_variant, &selected, &ctx),
             None,
             "lm-studio cannot serve safetensors and should not be picked"
+        );
+    }
+
+    // -- matching_catalog_ids ------------------------------------------------
+
+    #[test]
+    fn matching_catalog_ids_exact_existing() {
+        let m = recommended_config::StringMatch::Exact("granite-3.1-8b-instruct".to_string());
+        let ids = matching_catalog_ids(&m);
+        assert_eq!(ids, vec!["granite-3.1-8b-instruct"]);
+    }
+
+    #[test]
+    fn matching_catalog_ids_exact_nonexistent() {
+        let m = recommended_config::StringMatch::Exact("nonexistent-model".to_string());
+        let ids = matching_catalog_ids(&m);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn matching_catalog_ids_regex_sorted() {
+        let m = recommended_config::StringMatch::Regex {
+            regex: "granite-3\\.1".to_string(),
+        };
+        let ids = matching_catalog_ids(&m);
+        // Should contain granite-3.1 models, sorted
+        assert!(!ids.is_empty());
+        assert!(ids.windows(2).all(|w| w[0] <= w[1]));
+        assert!(ids.iter().any(|id| id.contains("3.1")));
+    }
+
+    // -- resolve_model_set -----------------------------------------------------
+
+    #[test]
+    fn resolve_model_set_ordered_fallback() {
+        // Build a hardware profile that can fit granite-4.2-8b but not 4.2-30b
+        let hardware = HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 32.0,
+        };
+        let ctx = test_ctx();
+        let healthy: Vec<String> = ["ollama".to_string()].into_iter().collect();
+
+        // Create a model set where the first candidate is 4.2-30b (won't fit),
+        // second is 4.2-8b (will fit)
+        let rec_30b = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-4.2-30b".to_string()),
+            variant_precisions: vec![],
+        };
+        let rec_8b = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-4.2-8b".to_string()),
+            variant_precisions: vec![],
+        };
+        let set = recommended_config::RecommendedModelSet {
+            min_context_length: None,
+            models: vec![rec_30b, rec_8b],
+        };
+
+        let result = resolve_model_set(&set, &hardware, &healthy, &ctx);
+        // Should resolve to the 8b model (first that fits), not 30b
+        assert!(
+            result.is_some(),
+            "should have resolved to 4.2-8b as fallback"
+        );
+        let (model_id, _) = result.unwrap();
+        assert_eq!(model_id, "granite-4.2-8b");
+    }
+
+    #[test]
+    fn resolve_model_set_variant_precision_filtering() {
+        let hardware = HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 64.0,
+        };
+        let ctx = test_ctx();
+        let healthy: Vec<String> = ["ollama".to_string()].into_iter().collect();
+
+        // granite-3.1-8b-instruct has many variants; only Q4_K_M/Q5_K_M
+        // are in the allow-list
+        let rec = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-3.1-8b-instruct".to_string()),
+            variant_precisions: vec![
+                recommended_config::StringMatch::Exact("Q4_K_M".to_string()),
+                recommended_config::StringMatch::Exact("Q5_K_M".to_string()),
+            ],
+        };
+        let set = recommended_config::RecommendedModelSet {
+            min_context_length: None,
+            models: vec![rec],
+        };
+
+        let result = resolve_model_set(&set, &hardware, &healthy, &ctx);
+        assert!(
+            result.is_some(),
+            "should resolve with precision-filtered variants"
+        );
+        let (_, variant) = result.unwrap();
+        // The selected variant's precision must be in the allow-list
+        assert!(
+            variant.precision == "Q4_K_M" || variant.precision == "Q5_K_M",
+            "variant precision should be in the allow-list, got '{}'",
+            variant.precision
+        );
+    }
+
+    #[test]
+    fn resolve_model_set_min_context_length_gates_effective_context() {
+        // A model with partial fit where the effective context is below
+        // min_context_length should be rejected.
+        // Use a small RAM profile to force partial fit.
+        let hardware = HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 4.0, // Very tight RAM
+        };
+        let ctx = test_ctx();
+        let healthy: Vec<String> = ["ollama".to_string()].into_iter().collect();
+
+        let rec = recommended_config::RecommendedModel {
+            model: recommended_config::StringMatch::Exact("granite-3.1-8b-instruct".to_string()),
+            variant_precisions: vec![],
+        };
+        // min_context_length of 100_000 is very high; with 4GB RAM the
+        // partial fit will be well below that.
+        let set = recommended_config::RecommendedModelSet {
+            min_context_length: Some(100_000),
+            models: vec![rec],
+        };
+
+        let result = resolve_model_set(&set, &hardware, &healthy, &ctx);
+        assert!(
+            result.is_none(),
+            "should reject model whose effective context is below min"
+        );
+    }
+
+    // -- resolve_capability ----------------------------------------------------
+
+    #[test]
+    fn resolve_capability_required_slot_missing_returns_none() {
+        let hardware = test_hardware_profile();
+        let ctx = test_ctx();
+        let healthy: Vec<String> = vec![];
+
+        // Capability requires model_id slot but no recommendation exists for it
+        let mut models = HashMap::new();
+        // Only provide a recommendation for "other_slot", not "model_id"
+        models.insert(
+            "other_slot".to_string(),
+            recommended_config::RecommendedModelSet {
+                min_context_length: None,
+                models: vec![recommended_config::RecommendedModel {
+                    model: recommended_config::StringMatch::Exact(
+                        "granite-3.1-8b-instruct".to_string(),
+                    ),
+                    variant_precisions: vec![],
+                }],
+            },
+        );
+        let rec_cap = recommended_config::RecommendedCapability {
+            capability: "agent-model".to_string(),
+            models,
+        };
+
+        let result = resolve_capability("agent-model", &rec_cap, &hardware, &healthy, &ctx);
+        assert!(
+            result.is_none(),
+            "should return None when required slot has no recommendation"
+        );
+    }
+
+    // -- Regression test: issue #129 bug ---------------------------------------
+
+    #[test]
+    fn claude_agent_model_resolution_never_picks_a_3b_class_model() {
+        // Regression test for issue #129: `claude` was getting wired to a
+        // 3B model because the generic `ModelRequirement` only checks
+        // Chat+ToolCalling (which a 3B model satisfies) and selection among
+        // qualifying models was nondeterministic (`HashSet` iteration
+        // order).
+        //
+        // This exercises the *real*, shipped `resources/recommended_configs/
+        // claude.yaml` data through the real resolution path
+        // (`effective_capabilities` + `resolve_capability`), deliberately
+        // bypassing `Discover::run`/`run_auto_with_hardware` -- going
+        // through the full pipeline would make this test depend on whether
+        // the `claude` binary happens to be on the test runner's PATH (for
+        // launcher detection) and would skip provider health-probing
+        // entirely for an already-configured provider, either of which lets
+        // the test pass vacuously (nothing resolves, so nothing is ever a
+        // 3B model) without actually exercising the fix. Driving
+        // `resolve_capability` directly, with an explicit `healthy` provider
+        // list, makes the check deterministic and environment-independent
+        // while still using the real production data and algorithm.
+        let hardware = test_hardware_profile();
+        let ctx = test_ctx();
+        let healthy = vec!["ollama".to_string()];
+
+        let rec_caps = recommended_config::effective_capabilities(
+            "claude",
+            &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+            &HashMap::new(),
+        );
+        let agent_model_cap = rec_caps
+            .iter()
+            .find(|c| c.capability == "agent-model")
+            .expect("claude.yaml defines an agent-model recommendation");
+
+        let resolved =
+            resolve_capability("agent-model", agent_model_cap, &hardware, &healthy, &ctx)
+                .expect("agent-model should resolve for claude given a healthy ollama provider");
+
+        let (model_id, _variant) = resolved
+            .slots
+            .get("model_id")
+            .expect("model_id slot should have resolved");
+
+        assert!(
+            !model_id.contains("3b") || model_id.contains("30b"),
+            "bug #129: claude's agent-model resolved to a 3B-class model: {model_id}"
+        );
+        // Positive check: it actually is one of claude.yaml's real granite-4.x
+        // candidates, not just "something that isn't 3b".
+        assert!(
+            model_id.starts_with("granite-4."),
+            "expected a granite-4.x candidate from claude.yaml, got '{model_id}'"
         );
     }
 }
