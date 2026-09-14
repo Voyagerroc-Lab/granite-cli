@@ -71,11 +71,6 @@ pub struct DiscoveryResult {
 struct Discover;
 
 impl Discover {
-    /// Run the full discovery pipeline against the machine's real hardware.
-    pub async fn run(ctx: &crate::AppContext) -> DiscoveryResult {
-        Self::run_with_hardware(ctx, &detect_hardware()).await
-    }
-
     /// Run the full discovery pipeline against a given hardware profile.
     /// Split out from `run` so tests can pin the hardware profile instead of
     /// depending on `detect_hardware()`'s result on whatever machine the
@@ -859,6 +854,25 @@ struct ResolvedCapability {
     slots: HashMap<String, (String, ModelVariant)>,
 }
 
+/// Healthy provider types found among a discovery pass's recommendations --
+/// shared by `run_auto_with_hardware` and `select_capabilities` so both use
+/// the exact same notion of "can actually run something right now" when
+/// deciding whether a recommended capability's model resolves.
+fn healthy_provider_types(discovery: &DiscoveryResult) -> Vec<String> {
+    discovery
+        .recommendations
+        .iter()
+        .filter_map(|r| match r {
+            Recommendation::Provider {
+                provider_type,
+                health_healthy: true,
+                ..
+            } => Some(provider_type.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Resolve one capability's model slots against a `RecommendedCapability`.
 /// Looks up the capability's `CAPABILITY_REGISTRY` metadata for its
 /// `Dependency::Model` requirements, then tries each candidate in the
@@ -1030,7 +1044,12 @@ impl SetupCommands {
         ui.info("=== granite-cli Setup Wizard ===\n");
         ui.info("Discovering available components...\n");
 
-        let discovery = Discover::run(ctx).await;
+        // Detected once and threaded through the selection phases (not just
+        // discovery) so `select_capabilities` can resolve recommended
+        // capabilities against the same hardware profile discovery used,
+        // rather than re-detecting (and potentially disagreeing).
+        let hardware = detect_hardware();
+        let discovery = Discover::run_with_hardware(ctx, &hardware).await;
 
         if discovery.recommendations.is_empty()
             && discovery.configured_provider_ids.is_empty()
@@ -1048,8 +1067,10 @@ impl SetupCommands {
         let selected_launchers = Self::select_launchers(ctx, &discovery).await?;
 
         // Phase 2: Capabilities selection (filtered by what the selected
-        // launchers can actually bind)
-        let selected_caps = Self::select_capabilities(ctx, &discovery, &selected_launchers).await?;
+        // launchers can actually bind, pre-selected only where a
+        // recommendation actually resolves on this hardware)
+        let selected_caps =
+            Self::select_capabilities(ctx, &discovery, &selected_launchers, &hardware).await?;
 
         // Phase 3: Models selection (filtered by capability requirements)
         let selected_models =
@@ -1150,18 +1171,7 @@ impl SetupCommands {
             .collect();
 
         // Compute healthy provider types from discovery recommendations
-        let healthy_provider_types: Vec<String> = discovery
-            .recommendations
-            .iter()
-            .filter_map(|r| match r {
-                Recommendation::Provider {
-                    provider_type,
-                    health_healthy: true,
-                    ..
-                } => Some(provider_type.to_string()),
-                _ => None,
-            })
-            .collect();
+        let healthy_provider_types = healthy_provider_types(&discovery);
 
         // Iterate launchers in sorted order for determinism, resolving
         // capabilities via the recommended config system.
@@ -1282,6 +1292,7 @@ impl SetupCommands {
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
         selected_launchers: &HashSet<String>,
+        hardware: &crate::utils::hardware::HardwareProfile,
     ) -> Result<HashSet<String>> {
         let ui = &*ctx.ui;
 
@@ -1297,26 +1308,55 @@ impl SetupCommands {
             })
             .collect();
 
-        // Intersect with recommended capabilities from effective_capabilities
-        let recommended_cap_types: HashSet<String> = selected_launchers
+        // Every capability type named by some selected launcher's effective
+        // config, whether or not it actually resolves on this machine --
+        // used only to decide which capabilities are shown at all (a
+        // launcher's curated intent), never to decide their checkbox
+        // default.
+        let effective_caps_by_launcher: Vec<recommended_config::RecommendedCapability> =
+            selected_launchers
+                .iter()
+                .flat_map(|launcher_type| {
+                    recommended_config::effective_capabilities(
+                        launcher_type,
+                        &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+                        &ctx.config.recommended_configs,
+                    )
+                })
+                .collect();
+        let declared_cap_types: HashSet<String> = effective_caps_by_launcher
             .iter()
-            .flat_map(|launcher_type| {
-                recommended_config::effective_capabilities(
-                    launcher_type,
-                    &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
-                    &ctx.config.recommended_configs,
+            .map(|rec_cap| rec_cap.capability.clone())
+            .collect();
+
+        // Subset of the above that actually resolves to a concrete model
+        // right now -- same resolution `run_auto_with_hardware` performs, so
+        // a capability naming a model too large for this machine (or one no
+        // healthy provider can serve) is never pre-selected, even though its
+        // launcher's config still lists it.
+        let healthy_provider_types = healthy_provider_types(discovery);
+        let resolvable_cap_types: HashSet<String> = effective_caps_by_launcher
+            .iter()
+            .filter(|rec_cap| {
+                resolve_capability(
+                    &rec_cap.capability,
+                    rec_cap,
+                    hardware,
+                    &healthy_provider_types,
+                    ctx,
                 )
+                .is_some()
             })
             .map(|rec_cap| rec_cap.capability.clone())
             .collect();
 
-        let caps: Vec<_> = if recommended_cap_types.is_empty() {
+        let caps: Vec<_> = if declared_cap_types.is_empty() {
             // No recommendations -- show all capabilities (original behavior)
             all_caps
         } else {
             all_caps
                 .into_iter()
-                .filter(|(cap_type, _)| recommended_cap_types.contains(cap_type))
+                .filter(|(cap_type, _)| declared_cap_types.contains(cap_type))
                 .collect()
         };
 
@@ -1329,7 +1369,13 @@ impl SetupCommands {
             .iter()
             .map(|(id, name)| format!("{id} — {name}"))
             .collect();
-        let defaults = vec![true; items.len()];
+        let defaults: Vec<bool> = if declared_cap_types.is_empty() {
+            vec![true; caps.len()]
+        } else {
+            caps.iter()
+                .map(|(cap_type, _)| resolvable_cap_types.contains(cap_type))
+                .collect()
+        };
 
         let selected = ui.multi_select("Select capabilities to configure", &items, &defaults)?;
 
@@ -1615,14 +1661,23 @@ impl SetupCommands {
             }
         }
 
-        let base_models = Revaluator::for_models(&discovery.recommendations, selected_caps);
         let filtered = if recommended_ids.is_empty() {
-            // No recommendations available -- show all models (original behavior)
-            Self::model_options(base_models)
+            // No recommendations available -- show all models (original
+            // behavior), from the deduped one-per-family list.
+            Self::model_options(Revaluator::for_models(
+                &discovery.recommendations,
+                selected_caps,
+            ))
         } else {
-            // Intersect with recommended ids
+            // `discovery.recommendations` keeps only the single largest
+            // fully-fitting size per model family, so a recommendation
+            // naming a smaller sibling (e.g. a 3b model for a lightweight
+            // capability when an 8b of the same family also fits) would
+            // never appear there at all. Source from the full candidate
+            // pool instead -- every recommended id gets a chance to show up
+            // -- then intersect with recommended_ids as before.
             Self::model_options(
-                base_models
+                Revaluator::for_models(&discovery.all_model_candidates, selected_caps)
                     .into_iter()
                     .filter(|r| {
                         if let Recommendation::Model { model_id, .. } = r {
@@ -2948,6 +3003,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn select_models_surfaces_a_recommended_smaller_sibling_the_deduped_list_would_hide() {
+        // Regression test for issue #129 (wizard path): claude.yaml
+        // recommends granite-4.2-3b for sub-agent-explore.
+        // `discovery.recommendations` (the deduped, one-per-family list
+        // `select_models`'s base list used to be sourced from exclusively)
+        // keeps only the single largest fully-fitting size per family --
+        // granite-4.2-8b under `test_hardware_profile`, since it fully fits
+        // -- so the recommended 3b never had a chance to appear as an
+        // option at all, even though `recommended_ids` correctly named it.
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext {
+            config: Config::default(),
+            ui: capture.clone(),
+        };
+        let discovery = run_discovery(&ctx).await;
+        // vision-mcp is included alongside sub-agent-explore so the
+        // top-level list isn't empty even before the fix (its recommended
+        // granite-vision-4.1-4b is its own family, so it survives the
+        // dedup) -- this reproduces the user's exact report ("only
+        // granite-4.2-8b and granite-vision-4.1-4b are shown"): the buggy
+        // behavior silently substitutes the wrong sibling rather than
+        // falling through to the "choose different models" escape hatch,
+        // which a completely-empty list (single-capability case) would
+        // mask.
+        let selected_caps: HashSet<String> =
+            ["sub-agent-explore".to_string(), "vision-mcp".to_string()]
+                .into_iter()
+                .collect();
+        let selected_launchers: HashSet<String> = ["claude".to_string()].into_iter().collect();
+
+        // First pass with no canned answer, just to inspect what's offered.
+        let _ =
+            SetupCommands::select_models(&mut ctx, &discovery, &selected_caps, &selected_launchers)
+                .await
+                .unwrap();
+        let idx = {
+            let prompts = capture.multi_select_prompts.borrow();
+            assert_eq!(prompts.len(), 1, "expected exactly one multi_select prompt");
+            let (_, items, defaults) = &prompts[0];
+            assert!(
+                items.iter().any(|i| i.starts_with("granite-vision-4.1-4b")),
+                "granite-vision-4.1-4b (recommended for vision-mcp) should be offered: {items:?}"
+            );
+            let idx = items
+                .iter()
+                .position(|i| i.starts_with("granite-4.2-3b"))
+                .expect(
+                    "granite-4.2-3b must be offered even though the deduped default list \
+                     would substitute 8b instead",
+                );
+            assert!(
+                defaults[idx],
+                "the recommended sub-agent-explore candidate should default to selected"
+            );
+            assert!(
+                !items.iter().any(|i| i.starts_with("granite-4.2-8b")),
+                "granite-4.2-8b is not recommended for either selected capability and must not \
+                 appear: {items:?}"
+            );
+            idx
+        };
+
+        capture
+            .multi_select_answers
+            .borrow_mut()
+            .push_back(vec![idx]);
+        let chosen =
+            SetupCommands::select_models(&mut ctx, &discovery, &selected_caps, &selected_launchers)
+                .await
+                .unwrap();
+        assert_eq!(chosen, HashSet::from(["granite-4.2-3b".to_string()]));
+    }
+
     // -- configure_all -----------------------------------------------------
 
     #[tokio::test]
@@ -3617,6 +3746,92 @@ mod tests {
                 || variant.format.eq_ignore_ascii_case("ollama"),
             "expected a variant Ollama can actually run, got format '{}'",
             variant.format
+        );
+    }
+
+    #[tokio::test]
+    async fn select_capabilities_does_not_pre_select_a_capability_whose_model_does_not_resolve() {
+        // Regression test for issue #129 (wizard path): claude.yaml
+        // recommends both sub-agent-explore (granite-4.2-3b, which fully
+        // fits `test_hardware_profile`) and sub-agent-code (granite-4.2-30b,
+        // which under the same profile only partially fits, below its
+        // required 65536 min_context_length, so it never resolves -- see
+        // `probe`-verified assumption shared with
+        // `claude_sub_agent_explore_resolves_against_the_real_shipped_config`).
+        // Both capabilities should still be *shown* (claude's own config
+        // names both), but only the one that actually resolves on this
+        // hardware should be pre-selected -- previously *every* capability
+        // a launcher's YAML named was pre-selected regardless of whether it
+        // could ever resolve.
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext {
+            config: Config::default(),
+            ui: capture.clone(),
+        };
+        let hardware = test_hardware_profile();
+
+        // Build a DiscoveryResult by hand (rather than the real
+        // `discover_providers` health probe, which would hit the network
+        // and could vacuously report every provider unhealthy) with a
+        // capability recommendation for every capability claude.yaml names,
+        // plus a healthy "ollama" provider so resolution has a real chance
+        // to succeed for the ones that fit.
+        let discovery = DiscoveryResult {
+            recommendations: vec![
+                Recommendation::Provider {
+                    provider_type: "ollama",
+                    provider_name: "Ollama".to_string(),
+                    health_healthy: true,
+                    health_error: None,
+                },
+                Recommendation::Capability {
+                    capability_type: "sub-agent-explore".to_string(),
+                    capability_name: "Sub-Agent: Explore".to_string(),
+                },
+                Recommendation::Capability {
+                    capability_type: "sub-agent-code".to_string(),
+                    capability_name: "Sub-Agent: Code".to_string(),
+                },
+            ],
+            all_model_candidates: vec![],
+            configured_provider_ids: vec![],
+            configured_model_ids: vec![],
+            configured_launcher_ids: vec![],
+            configured_capability_ids: vec![],
+        };
+        let selected_launchers: HashSet<String> = ["claude".to_string()].into_iter().collect();
+
+        let _ = SetupCommands::select_capabilities(
+            &mut ctx,
+            &discovery,
+            &selected_launchers,
+            &hardware,
+        )
+        .await
+        .unwrap();
+
+        let prompts = capture.multi_select_prompts.borrow();
+        assert_eq!(prompts.len(), 1, "expected exactly one multi_select prompt");
+        let (_, items, defaults) = &prompts[0];
+        let explore_idx = items
+            .iter()
+            .position(|i| i.starts_with("sub-agent-explore"))
+            .expect("sub-agent-explore must be offered as an option");
+        let code_idx = items
+            .iter()
+            .position(|i| i.starts_with("sub-agent-code"))
+            .expect(
+                "sub-agent-code must still be offered as an option even though it can't resolve",
+            );
+
+        assert!(
+            defaults[explore_idx],
+            "sub-agent-explore resolves on this hardware, so it must be pre-selected"
+        );
+        assert!(
+            !defaults[code_idx],
+            "sub-agent-code cannot resolve on this hardware (30b doesn't fit), so it must NOT \
+             be pre-selected even though claude.yaml names it"
         );
     }
 }
