@@ -1,0 +1,44 @@
+# Default (wildcard) recommended configuration: applies to every launcher
+# without its own more-specific file.
+
+launcher: "*"
+
+capabilities:
+  - capability: agent-model
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-30b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-30b
+            variant_formats:
+              - Ollama
+              - GGUF
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+          - model: granite-4.2-8b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-8b
+            variant_formats:
+              - Ollama
+              - GGUF
+            variant_precisions:
+              - Q8_0
+
+  - capability: vision-mcp
+    models:
+      model_id:
+        min_context_length: 4096
+        models:
+          - model: granite-vision-4.1-4b
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0

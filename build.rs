@@ -5,11 +5,19 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=resources/models.yaml");
+    println!("cargo:rerun-if-changed=resources/recommended_configs");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/tags");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_models.rs");
+
+    // Generate recommended-config sources (same pattern as generated_models.rs)
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let rc_dir = Path::new(&manifest_dir).join("resources/recommended_configs");
+    let rc_entries = generate_recommended_config_sources(&rc_dir);
+    let rc_path = Path::new(&out_dir).join("generated_recommended_configs.rs");
+    fs::write(&rc_path, rc_entries).expect("Failed to write generated_recommended_configs.rs");
 
     let yaml_content =
         fs::read_to_string("resources/models.yaml").expect("Failed to read models.yaml");
@@ -537,4 +545,42 @@ pub fn version_string() -> String {{
 "#,
         info.base_version, info.commit_hash, info.commits_since_tag, info.has_uncommitted
     )
+}
+
+/*-- recommended configs --*/
+
+fn generate_recommended_config_sources(rc_dir: &Path) -> String {
+    let mut code =
+        String::from("// Auto-generated from resources/recommended_configs/ - do not edit\n\n");
+
+    // Collect and sort YAML files for deterministic output
+    let mut entries: Vec<(String, String)> = Vec::new();
+    if let Ok(dir) = fs::read_dir(rc_dir) {
+        for entry in dir.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("yaml file stem")
+                    .to_string();
+                // Use absolute path so include_str! works regardless of OUT_DIR
+                let abs_path = path
+                    .canonicalize()
+                    .expect("failed to canonicalize recommended config path");
+                entries.push((stem, abs_path.to_str().unwrap().to_string()));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    code.push_str("pub const RECOMMENDED_CONFIG_SOURCES: &[(&str, &str)] = &[\n");
+    for (name, path) in &entries {
+        code.push_str(&format!(
+            r#"    ("{name}", include_str!("{path}")),
+"#
+        ));
+    }
+    code.push_str("];\n");
+    code
 }

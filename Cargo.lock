@@ -1008,6 +1008,7 @@ dependencies = [
  "openssl",
  "paste",
  "ratatui",
+ "regex",
  "reqwest",
  "rmcp",
  "schemars",

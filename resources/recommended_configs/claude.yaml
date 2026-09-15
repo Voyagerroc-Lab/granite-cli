@@ -1,0 +1,68 @@
+# Recommended configuration for the `claude` launcher.
+
+launcher: "claude"
+
+capabilities:
+
+  - capability: sub-agent-code
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-30b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-30b
+            variant_formats:
+              - Ollama
+              - GGUF
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+
+  - capability: sub-agent-explore
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-3b
+            variant_formats:
+              - Ollama
+              - GGUF
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+
+  - capability: sub-agent-plan
+    models:
+      model_id:
+        min_context_length: 65536
+        models:
+          - model: granite-4.2-30b
+            variant_formats:
+              - OpenRouter
+          - model: granite-4.2-30b
+            variant_formats:
+              - Ollama
+              - GGUF
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0
+
+  - capability: vision-mcp
+    models:
+      model_id:
+        min_context_length: 4096
+        models:
+          - model: granite-vision-4.1-4b
+            variant_precisions:
+              - Q4_K_M
+              - Q5_K_M
+              - Q6_K
+              - Q8_0

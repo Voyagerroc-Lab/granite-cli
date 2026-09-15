@@ -7,3 +7,4 @@
     2. Public functions/structs/enums/etc (mark with `/*-- public --*/` to begin section)
     3. Private functions/structs/enums/etc (mark with `/*-- private --*/` to begin seciton)
     4. Tests (mark with `/*-- tests --*/` to begin seciton)
+- When formatting code, use `./scripts/fmt.sh` which runs both `clippy` and `fmt` with the right versions of the rust toolchain via `rustup`
