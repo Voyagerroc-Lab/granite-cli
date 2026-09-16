@@ -302,12 +302,15 @@ impl HermesLauncher {
             for (name, binding) in &self.bound_mcp_bindings {
                 mcp_servers.insert(name.clone(), {
                     match binding {
-                        McpBinding::Stdio { command, args, env } => serde_json::json!({
+                        McpBinding::Stdio {
+                            command, args, env, ..
+                        } => serde_json::json!({
                             "command": command,
                             "args": args,
                             "env": env,
                         }),
-                        McpBinding::Http { url, headers } | McpBinding::Sse { url, headers } => {
+                        McpBinding::Http { url, headers, .. }
+                        | McpBinding::Sse { url, headers, .. } => {
                             serde_json::json!({
                                 "url": url,
                                 "headers": headers,
@@ -648,6 +651,7 @@ mod tests {
                 command: "/usr/local/bin/granite-cli".to_string(),
                 args: vec!["__mcp-serve".to_string(), "vision".to_string()],
                 env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+                timeout: None,
             },
         ));
         l.bound_mcp_bindings.push((
@@ -658,6 +662,7 @@ mod tests {
                     "Authorization".to_string(),
                     "Bearer x".to_string(),
                 )]),
+                timeout: None,
             },
         ));
         let config = l.generate_config().unwrap();

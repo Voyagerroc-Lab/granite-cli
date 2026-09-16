@@ -35,6 +35,9 @@ futures-util = "0.3"
 serde_valid = "2.0.3"
 axum = "0.8"
 bytes = "1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 rmcp = { version = "3.1", features = [
     "macros",
     "schemars",

@@ -8,8 +8,10 @@
 //! through from the user's directory -- and points the child process at it with
 //! `PI_CODING_AGENT_DIR`.
 
-use crate::capabilities::{AgentModelBinding, BindingType, Capability};
-use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
+use crate::capabilities::{AgentModelBinding, BindingType, Capability, ToolName};
+use crate::launchers::base::{
+    EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command, run_command_captured,
+};
 use crate::providers::ApiType;
 use crate::registry::ConfigConstructable;
 use crate::utils::resolve_shell_command;
@@ -158,37 +160,7 @@ impl Launcher for PiLauncher {
         let overlay = self.env_overlay(ctx).await?;
         alog_channel!(MessageLevel::Debug2, "Env Overlay: {:#?}", overlay);
 
-        let mut pi_args: Vec<String> = vec![];
-        if let Some(binding) = &self.bound_binding {
-            let provider_name = &binding.provider_name;
-            let entry = self.provider_entry(binding)?;
-            let state_dir = pi_state_dir(ctx)?;
-            let source_dir = pi_source_dir()?;
-
-            if ctx.dry_run {
-                ui.info(&format!(
-                    "Would write Pi provider '{provider_name}' into {}:",
-                    state_dir.join(MODELS_JSON).display()
-                ));
-                ui.info(&serde_json::to_string_pretty(&entry)?);
-                ui.info(&format!(
-                    "  (merged over {}, which is left unmodified)",
-                    source_dir.join(MODELS_JSON).display()
-                ));
-            } else {
-                materialize_pi_config(&state_dir, &source_dir, provider_name, entry, ui)?;
-                ui.info(&format!(
-                    "Wrote Pi provider '{provider_name}' to {}",
-                    state_dir.join(MODELS_JSON).display()
-                ));
-            }
-            pi_args.extend([
-                "--provider".to_string(),
-                provider_name.clone(),
-                "--model".to_string(),
-                binding.model_name.clone(),
-            ]);
-        }
+        let mut pi_args = self.provider_prefix_args(ctx, ui).await?;
         pi_args.extend_from_slice(args);
 
         run_command(binary, &overlay, &pi_args, ctx, ui).await
@@ -264,6 +236,281 @@ impl PiLauncher {
         }
         Ok(entry)
     }
+
+    /// Materializes the granite-cli Pi config directory for the bound model (if
+    /// any) and returns the `--provider`/`--model` args selecting it. Shared by
+    /// `launch` and `run_delegated_task`, which both need Pi pointed at the same
+    /// generated config before anything else on the command line.
+    async fn provider_prefix_args(
+        &self,
+        ctx: &LaunchContext,
+        ui: &dyn Ui,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut pi_args: Vec<String> = vec![];
+        if let Some(binding) = &self.bound_binding {
+            let provider_name = &binding.provider_name;
+            let entry = self.provider_entry(binding)?;
+            let state_dir = pi_state_dir(ctx)?;
+            let source_dir = pi_source_dir()?;
+
+            if ctx.dry_run {
+                ui.info(&format!(
+                    "Would write Pi provider '{provider_name}' into {}:",
+                    state_dir.join(MODELS_JSON).display()
+                ));
+                ui.info(&serde_json::to_string_pretty(&entry)?);
+                ui.info(&format!(
+                    "  (merged over {}, which is left unmodified)",
+                    source_dir.join(MODELS_JSON).display()
+                ));
+            } else {
+                materialize_pi_config(&state_dir, &source_dir, provider_name, entry, ui)?;
+                ui.info(&format!(
+                    "Wrote Pi provider '{provider_name}' to {}",
+                    state_dir.join(MODELS_JSON).display()
+                ));
+            }
+            pi_args.extend([
+                "--provider".to_string(),
+                provider_name.clone(),
+                "--model".to_string(),
+                binding.model_name.clone(),
+            ]);
+        }
+        Ok(pi_args)
+    }
+
+    /// Runs `pi` headlessly for one delegated sub-agent task and returns its
+    /// captured stdout. Requires a prior `bind_capability` call -- there is no
+    /// sensible way to pick a model on the caller's behalf, so an unbound
+    /// launcher here is a bug in the caller, not a runtime condition.
+    pub(crate) async fn run_delegated_task(
+        &self,
+        binary: &Path,
+        task: &str,
+        system_prompt: &str,
+        tools: &[ToolName],
+        ctx: &LaunchContext,
+        ui: &dyn Ui,
+    ) -> anyhow::Result<String> {
+        if self.bound_binding.is_none() {
+            anyhow::bail!("run_delegated_task requires a bound model; call bind_capability first");
+        }
+
+        let mut full_args = self.provider_prefix_args(ctx, ui).await?;
+        full_args.extend([
+            "--print".to_string(),
+            "--no-session".to_string(),
+            "--system-prompt".to_string(),
+            system_prompt.to_string(),
+        ]);
+        if let Some(csv) = tools_csv(tools) {
+            full_args.push("--tools".to_string());
+            full_args.push(csv);
+        }
+        full_args.push(task.to_string());
+
+        let overlay = self.env_overlay(ctx).await?;
+        let (status, stdout, stderr) =
+            run_command_captured(binary.to_path_buf(), &overlay, &full_args, ctx).await?;
+        if !status.success() {
+            anyhow::bail!("pi exited with {status}: {stderr}");
+        }
+        Ok(stdout.trim_end().to_string())
+    }
+}
+
+/// Maps a canonical `ToolName` onto Pi's own built-in tool-name strings
+/// (`read, bash, edit, write, grep, find, ls`, per Pi's documentation). Pi has
+/// no web-fetch/web-search built-ins and no MCP tool-name convention of its
+/// own to target, so those map to `None`; `Other` is the escape hatch and
+/// passes through verbatim, matching `Launcher::map_tool_name`'s default.
+pub(crate) fn pi_tool_name(tool: &ToolName) -> Option<String> {
+    match tool {
+        ToolName::FileRead => Some("read".to_string()),
+        ToolName::Shell => Some("bash".to_string()),
+        ToolName::FileEdit => Some("edit".to_string()),
+        ToolName::FileWrite => Some("write".to_string()),
+        ToolName::Search => Some("grep".to_string()),
+        ToolName::FileSearch => Some("find".to_string()),
+        ToolName::WebFetch | ToolName::WebSearch | ToolName::Mcp { .. } => None,
+        ToolName::Other(raw) => Some(raw.clone()),
+    }
+}
+
+/// Builds the `--tools` value for a delegated task: each tool mapped through
+/// [`pi_tool_name`], unmapped ones dropped, comma-joined. `None` (rather than
+/// `Some(String::new())`) when nothing maps, so the caller omits `--tools`
+/// entirely instead of passing an empty allow-list -- Pi would read that as
+/// "no tools" rather than "no restriction."
+fn tools_csv(tools: &[ToolName]) -> Option<String> {
+    let mapped: Vec<String> = tools.iter().filter_map(pi_tool_name).collect();
+    if mapped.is_empty() {
+        None
+    } else {
+        Some(mapped.join(","))
+    }
+}
+
+/// The cached `pi` binary's filename within the download cache directory.
+fn pi_binary_filename() -> &'static str {
+    if cfg!(windows) { "pi.exe" } else { "pi" }
+}
+
+/// Maps a (`std::env::consts::OS`, `std::env::consts::ARCH`) pair onto the
+/// release asset Pi publishes for it. Parameterized rather than reading
+/// `std::env::consts` directly so the mapping is testable on every host.
+fn pi_release_asset_name_for(os: &str, arch: &str) -> anyhow::Result<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok("pi-darwin-arm64.tar.gz"),
+        ("macos", "x86_64") => Ok("pi-darwin-x64.tar.gz"),
+        ("linux", "aarch64") => Ok("pi-linux-arm64.tar.gz"),
+        ("linux", "x86_64") => Ok("pi-linux-x64.tar.gz"),
+        ("windows", "x86_64") => Ok("pi-windows-x64.zip"),
+        ("windows", "aarch64") => Ok("pi-windows-arm64.zip"),
+        _ => anyhow::bail!("no pi release binary is published for {os}/{arch}"),
+    }
+}
+
+/// [`pi_release_asset_name_for`] applied to the actual host.
+fn pi_release_asset_name() -> anyhow::Result<&'static str> {
+    pi_release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Finds the checksum for `filename` in `sha256sum`-format text
+/// (`<hex><whitespace><filename>` per line, filename optionally prefixed with
+/// `*` for binary mode). Pure and network-free so the parsing logic is
+/// testable without a live `SHA256SUMS` fetch.
+fn find_sha256(sums_text: &str, filename: &str) -> Option<String> {
+    sums_text.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == filename {
+            Some(hash.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolves the `pi` binary to run: an explicit override or `PATH` entry if
+/// one resolves, otherwise a cached download under `cache_dir`, downloading
+/// and checksum-verifying a fresh copy only if the cache is empty.
+pub(crate) async fn ensure_pi_binary(
+    override_path: &Option<String>,
+    cache_dir: &Path,
+    ui: &dyn Ui,
+) -> anyhow::Result<PathBuf> {
+    if let Ok(path) = resolve_shell_command(override_path, "pi") {
+        return Ok(path);
+    }
+
+    if let Ok(cached) = locate_extracted_binary(cache_dir) {
+        return Ok(cached);
+    }
+
+    let asset = pi_release_asset_name()?;
+    ui.info(&format!("Downloading pi ({asset})..."));
+    let bytes = reqwest::get(format!(
+        "https://github.com/earendil-works/pi/releases/latest/download/{asset}"
+    ))
+    .await
+    .with_context(|| format!("Failed to download {asset}"))?
+    .error_for_status()
+    .with_context(|| format!("Failed to download {asset}"))?
+    .bytes()
+    .await
+    .with_context(|| format!("Failed to read downloaded {asset}"))?;
+
+    let sums_text =
+        reqwest::get("https://github.com/earendil-works/pi/releases/latest/download/SHA256SUMS")
+            .await
+            .context("Failed to download SHA256SUMS")?
+            .error_for_status()
+            .context("Failed to download SHA256SUMS")?
+            .text()
+            .await
+            .context("Failed to read SHA256SUMS")?;
+
+    ui.info("Verifying checksum...");
+    let expected = find_sha256(&sums_text, asset)
+        .ok_or_else(|| anyhow::anyhow!("SHA256SUMS has no entry for {asset}"))?;
+    let actual = openssl::sha::sha256(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    if !expected.eq_ignore_ascii_case(&actual) {
+        anyhow::bail!("checksum mismatch for {asset}: expected {expected}, got {actual}");
+    }
+
+    ui.info("Extracting pi...");
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("Failed to create {}", cache_dir.display()))?;
+    if asset.ends_with(".tar.gz") {
+        let tar = flate2::read::GzDecoder::new(bytes.as_ref());
+        tar::Archive::new(tar)
+            .unpack(cache_dir)
+            .with_context(|| format!("Failed to extract {asset}"))?;
+    } else {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))
+            .with_context(|| format!("Failed to open {asset} as a zip archive"))?;
+        archive
+            .extract(cache_dir)
+            .with_context(|| format!("Failed to extract {asset}"))?;
+    }
+
+    let binary_path = locate_extracted_binary(cache_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to mark {} executable", binary_path.display()))?;
+    }
+
+    ui.info(&format!("pi is ready at {}", binary_path.display()));
+    Ok(binary_path)
+}
+
+/// Finds the `pi`/`pi.exe` binary within a just-extracted cache directory.
+/// Checks the flat layout first, then falls back to a shallow scan (the
+/// directory itself, then one level of subdirectories) for archives that
+/// wrap their contents in a top-level directory.
+fn locate_extracted_binary(cache_dir: &Path) -> anyhow::Result<PathBuf> {
+    let name = pi_binary_filename();
+    let flat = cache_dir.join(name);
+    if flat.is_file() {
+        return Ok(flat);
+    }
+
+    let mut subdirs = vec![];
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().is_some_and(|f| f == name) {
+                return Ok(path);
+            }
+            if path.is_dir() {
+                subdirs.push(path);
+            }
+        }
+    }
+    for dir in subdirs {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    anyhow::bail!(
+        "could not find extracted '{name}' binary under {}",
+        cache_dir.display()
+    )
 }
 
 /// Maps a granite-cli `ApiType` onto Pi's `api` discriminator.
@@ -1008,5 +1255,168 @@ mod tests {
         // Without a binding there is no generated config, so Pi keeps using the
         // user's own directory.
         assert!(!infos.iter().any(|m| m.contains(CONFIG_DIR_ENV)));
+    }
+
+    // -- pi_tool_name ------------------------------------------------------------
+
+    #[test]
+    fn pi_tool_name_covers_every_canonical_variant_and_passes_other_through() {
+        assert_eq!(pi_tool_name(&ToolName::FileRead), Some("read".to_string()));
+        assert_eq!(pi_tool_name(&ToolName::Shell), Some("bash".to_string()));
+        assert_eq!(pi_tool_name(&ToolName::FileEdit), Some("edit".to_string()));
+        assert_eq!(
+            pi_tool_name(&ToolName::FileWrite),
+            Some("write".to_string())
+        );
+        assert_eq!(pi_tool_name(&ToolName::Search), Some("grep".to_string()));
+        assert_eq!(
+            pi_tool_name(&ToolName::FileSearch),
+            Some("find".to_string())
+        );
+        assert_eq!(pi_tool_name(&ToolName::WebFetch), None);
+        assert_eq!(pi_tool_name(&ToolName::WebSearch), None);
+        assert_eq!(
+            pi_tool_name(&ToolName::Mcp {
+                server: "vision".to_string(),
+                tool: None,
+            }),
+            None
+        );
+        assert_eq!(
+            pi_tool_name(&ToolName::Mcp {
+                server: "vision".to_string(),
+                tool: Some("analyze".to_string()),
+            }),
+            None
+        );
+        assert_eq!(
+            pi_tool_name(&ToolName::Other("custom-tool".to_string())),
+            Some("custom-tool".to_string())
+        );
+    }
+
+    // -- tools_csv ---------------------------------------------------------------
+
+    #[test]
+    fn tools_csv_is_none_for_empty_input() {
+        assert_eq!(tools_csv(&[]), None);
+    }
+
+    #[test]
+    fn tools_csv_is_none_when_nothing_maps() {
+        assert_eq!(tools_csv(&[ToolName::WebFetch, ToolName::WebSearch]), None);
+    }
+
+    #[test]
+    fn tools_csv_joins_only_the_mapped_subset_in_order() {
+        let tools = [
+            ToolName::FileRead,
+            ToolName::WebFetch,
+            ToolName::Shell,
+            ToolName::FileEdit,
+        ];
+        assert_eq!(tools_csv(&tools), Some("read,bash,edit".to_string()));
+    }
+
+    // -- pi_release_asset_name_for -----------------------------------------------
+
+    #[test]
+    fn release_asset_name_covers_every_supported_combo() {
+        assert_eq!(
+            pi_release_asset_name_for("macos", "aarch64").unwrap(),
+            "pi-darwin-arm64.tar.gz"
+        );
+        assert_eq!(
+            pi_release_asset_name_for("macos", "x86_64").unwrap(),
+            "pi-darwin-x64.tar.gz"
+        );
+        assert_eq!(
+            pi_release_asset_name_for("linux", "aarch64").unwrap(),
+            "pi-linux-arm64.tar.gz"
+        );
+        assert_eq!(
+            pi_release_asset_name_for("linux", "x86_64").unwrap(),
+            "pi-linux-x64.tar.gz"
+        );
+        assert_eq!(
+            pi_release_asset_name_for("windows", "x86_64").unwrap(),
+            "pi-windows-x64.zip"
+        );
+        assert_eq!(
+            pi_release_asset_name_for("windows", "aarch64").unwrap(),
+            "pi-windows-arm64.zip"
+        );
+    }
+
+    #[test]
+    fn release_asset_name_rejects_unsupported_combo() {
+        let err = pi_release_asset_name_for("freebsd", "x86_64")
+            .expect_err("must fail")
+            .to_string();
+        assert!(err.contains("freebsd"), "{err}");
+        assert!(err.contains("x86_64"), "{err}");
+    }
+
+    // -- find_sha256 ---------------------------------------------------------------
+
+    const SUMS_SAMPLE: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefab  pi-darwin-arm64.tar.gz\n789fed789fed789fed789fed789fed789fed789fed789fed789fed789fed78  pi-linux-x64.tar.gz\n";
+
+    #[test]
+    fn find_sha256_returns_hash_for_matching_filename() {
+        assert_eq!(
+            find_sha256(SUMS_SAMPLE, "pi-linux-x64.tar.gz"),
+            Some("789fed789fed789fed789fed789fed789fed789fed789fed789fed789fed78".to_string())
+        );
+    }
+
+    #[test]
+    fn find_sha256_returns_none_for_unknown_filename() {
+        assert_eq!(find_sha256(SUMS_SAMPLE, "pi-windows-x64.zip"), None);
+    }
+
+    #[test]
+    fn find_sha256_strips_leading_binary_mode_marker() {
+        let sums = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefab *pi-darwin-arm64.tar.gz\n";
+        assert_eq!(
+            find_sha256(sums, "pi-darwin-arm64.tar.gz"),
+            Some("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefab".to_string())
+        );
+    }
+
+    // -- run_delegated_task --------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_delegated_task_requires_a_bound_model() {
+        let l = launcher(serde_json::json!({ "command_path": "ls" }));
+        let ui = CaptureUi::default();
+        let result = l
+            .run_delegated_task(
+                &PathBuf::from("ls"),
+                "do the thing",
+                "you are a helper",
+                &[],
+                &ctx(true),
+                &ui,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_delegated_task_dry_run_returns_empty_output() {
+        let l = bound(serde_json::json!({ "command_path": "ls" }), binding());
+        let ui = CaptureUi::default();
+        let output = l
+            .run_delegated_task(
+                &PathBuf::from("ls"),
+                "do the thing",
+                "you are a helper",
+                &[ToolName::FileRead, ToolName::Shell],
+                &ctx(true),
+                &ui,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, String::new());
     }
 }

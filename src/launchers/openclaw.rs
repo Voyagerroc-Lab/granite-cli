@@ -278,17 +278,19 @@ fn generate_config(
         for (name, binding) in mcp_bindings {
             servers.insert(name.clone(), {
                 match binding {
-                    McpBinding::Stdio { command, args, env } => serde_json::json!({
+                    McpBinding::Stdio {
+                        command, args, env, ..
+                    } => serde_json::json!({
                         "command": command,
                         "args": args,
                         "env": env,
                     }),
-                    McpBinding::Http { url, headers } => serde_json::json!({
+                    McpBinding::Http { url, headers, .. } => serde_json::json!({
                         "url": url,
                         "transport": "streamable-http",
                         "headers": headers,
                     }),
-                    McpBinding::Sse { url, headers } => serde_json::json!({
+                    McpBinding::Sse { url, headers, .. } => serde_json::json!({
                         "url": url,
                         "transport": "sse",
                         "headers": headers,
@@ -465,6 +467,7 @@ mod tests {
         let mcp_binding = McpBinding::Http {
             url: "http://127.0.0.1:9999".to_string(),
             headers: Default::default(),
+            timeout: None,
         };
         let config = generate_config(None, &[("vision".to_string(), mcp_binding)]);
         assert!(config.get("models").is_none());
@@ -484,6 +487,7 @@ mod tests {
             command: "/usr/local/bin/granite-cli".to_string(),
             args: vec!["__mcp-serve".to_string(), "vision".to_string()],
             env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            timeout: None,
         };
         let config = generate_config(None, &[("vision".to_string(), mcp_binding)]);
         assert_eq!(

@@ -3236,14 +3236,32 @@ mod tests {
         let ctx = test_ctx();
         let discovery = run_discovery(&ctx).await;
 
-        // bob only supports the Mcp binding, so only vision-mcp should show.
+        // bob supports both the Mcp and SubAgent bindings (the latter via its
+        // in-process `pi`-backed delegate MCP server), so both vision-mcp
+        // (Mcp) and the sub-agent family (SubAgent) should show -- but
+        // nothing needing a binding bob doesn't support (e.g. a bare
+        // AgentModel-only capability, if one existed).
         let bob_only: HashSet<String> = ["bob".to_string()].into_iter().collect();
         let filtered = Revaluator::for_capabilities(&discovery, &bob_only);
-        assert!(
-            filtered
-                .iter()
-                .all(|r| matches!(r, Recommendation::Capability { capability_type, .. } if capability_type == "vision-mcp")),
-            "with only bob (Mcp-only) selected, only vision-mcp should be recommended"
+        let capability_types: HashSet<&str> = filtered
+            .iter()
+            .filter_map(|r| match r {
+                Recommendation::Capability {
+                    capability_type, ..
+                } => Some(capability_type.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            capability_types,
+            HashSet::from([
+                "vision-mcp",
+                "sub-agent",
+                "sub-agent-code",
+                "sub-agent-explore",
+                "sub-agent-plan",
+            ]),
+            "with only bob selected, vision-mcp (Mcp) and the sub-agent family (SubAgent) should be recommended: {capability_types:?}"
         );
     }
 

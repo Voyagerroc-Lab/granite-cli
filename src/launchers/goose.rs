@@ -240,7 +240,9 @@ impl Launcher for GooseLauncher {
         let mut extension_flags: Vec<String> = vec![];
         for (_, binding) in &self.bound_mcp_bindings {
             match binding {
-                McpBinding::Stdio { command, args, env } => {
+                McpBinding::Stdio {
+                    command, args, env, ..
+                } => {
                     // Goose's `--with-extension` takes a single shell-style
                     // command string; env vars are inlined as `KEY=value`
                     // prefixes ahead of the command per goose's own docs.
@@ -251,7 +253,7 @@ impl Launcher for GooseLauncher {
                     extension_flags.push("--with-extension".to_string());
                     extension_flags.push(parts.join(" "));
                 }
-                McpBinding::Http { url, headers } | McpBinding::Sse { url, headers } => {
+                McpBinding::Http { url, headers, .. } | McpBinding::Sse { url, headers, .. } => {
                     if !headers.is_empty() {
                         ui.warn(
                             "goose's --with-streamable-http-extension does not support \
@@ -637,6 +639,7 @@ mod tests {
                 command: "granite-cli".to_string(),
                 args: vec!["__mcp-serve".to_string(), "vision".to_string()],
                 env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+                timeout: None,
             },
         );
         let ui = CaptureUi::default();
@@ -664,6 +667,7 @@ mod tests {
             McpBinding::Http {
                 url: "http://127.0.0.1:54321/mcp".to_string(),
                 headers: Default::default(),
+                timeout: None,
             },
         );
         let ui = CaptureUi::default();
@@ -690,6 +694,7 @@ mod tests {
                     "Authorization".to_string(),
                     "Bearer x".to_string(),
                 )]),
+                timeout: None,
             },
         );
         let ui = CaptureUi::default();
