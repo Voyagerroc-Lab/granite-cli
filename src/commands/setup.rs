@@ -857,6 +857,22 @@ struct ResolvedCapability {
     slots: HashMap<String, (String, ModelVariant)>,
 }
 
+/// What `setup --auto` passes to `configure_all`, built by
+/// `SetupCommands::auto_selection`.
+#[derive(Default)]
+struct AutoSelection {
+    capabilities: HashSet<String>,
+    models: HashSet<String>,
+    /// model id -> the variant its capability's recommendation resolved to
+    variants: HashMap<String, ModelVariant>,
+    providers: HashSet<String>,
+    /// capability type -> config_key -> model id
+    resolved_capability_models: HashMap<String, HashMap<String, String>>,
+    /// launcher type -> the capability types its recommended config lists,
+    /// whether or not they resolved
+    recommended_capability_types_by_launcher: HashMap<String, HashSet<String>>,
+}
+
 /// Healthy provider types found among a discovery pass's recommendations --
 /// shared by `run_auto_with_hardware` and `select_capabilities` so both use
 /// the exact same notion of "can actually run something right now" when
@@ -1314,25 +1330,54 @@ impl SetupCommands {
         // Compute healthy provider types from discovery recommendations
         let healthy_provider_types = healthy_provider_types(&discovery);
 
+        let selection =
+            Self::auto_selection(ctx, &selected_launchers, &healthy_provider_types, hardware);
+
+        // --auto is non-interactive, so there's no prompt for variant
+        // selection -- `configure_all` falls back to discovery's
+        // hardware-fit `best_variant` for every model.
+        Self::configure_all(
+            ctx,
+            &discovery,
+            &selection.capabilities,
+            &selected_launchers,
+            &selection.providers,
+            &selection.models,
+            &selection.variants,
+            &selection.resolved_capability_models,
+            &selection.recommended_capability_types_by_launcher,
+        )
+        .await?;
+
+        // Never auto-pull in --auto mode
+        Self::print_summary(
+            ctx,
+            &selection.capabilities,
+            &selected_launchers,
+            &selection.providers,
+            &selection.models,
+        );
+
+        Ok(())
+    }
+
+    /// Resolves the recommended config of each launcher in `launchers`
+    /// against `hardware` and `healthy_provider_types`, and returns what
+    /// `run_auto_with_hardware` passes to `configure_all`. A capability in a
+    /// launcher's config is resolved only when the launcher supports one of
+    /// the capability's binding types.
+    fn auto_selection(
+        ctx: &crate::AppContext,
+        launchers: &HashSet<String>,
+        healthy_provider_types: &[String],
+        hardware: &HardwareProfile,
+    ) -> AutoSelection {
+        let ui = &*ctx.ui;
+        let mut selection = AutoSelection::default();
+
         // Iterate launchers in sorted order for determinism, resolving
         // capabilities via the recommended config system.
-        let mut selected_caps: HashSet<String> = HashSet::new();
-        let mut selected_models: HashSet<String> = HashSet::new();
-        let mut selected_variants: HashMap<String, ModelVariant> = HashMap::new();
-        let mut selected_providers: HashSet<String> = HashSet::new();
-        let mut resolved_capability_models: HashMap<String, HashMap<String, String>> =
-            HashMap::new();
-        // launcher_type -> capability_types that launcher's own effective
-        // config lists, whether or not resolution for it succeeded --
-        // recorded regardless of outcome, since it reflects the launcher's
-        // own curated intent, not just what happened to resolve. Passed to
-        // `configure_all` so a capability recommended for one launcher
-        // never gets enabled on a different one just because their binding
-        // types happen to overlap too.
-        let mut recommended_capability_types_by_launcher: HashMap<String, HashSet<String>> =
-            HashMap::new();
-
-        let mut sorted_launchers: Vec<String> = selected_launchers.iter().cloned().collect();
+        let mut sorted_launchers: Vec<String> = launchers.iter().cloned().collect();
         sorted_launchers.sort();
 
         for launcher_type in &sorted_launchers {
@@ -1341,28 +1386,55 @@ impl SetupCommands {
                 &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
                 &ctx.config.recommended_configs,
             );
-            recommended_capability_types_by_launcher.insert(
+            // Recorded before the binding check below: `configure_all`
+            // reads it to decide which launchers a capability is
+            // recommended for.
+            selection.recommended_capability_types_by_launcher.insert(
                 launcher_type.clone(),
                 effective_caps
                     .iter()
                     .map(|c| c.capability.clone())
                     .collect(),
             );
+            let Some(launcher_meta) = LAUNCHER_REGISTRY.get(launcher_type) else {
+                continue;
+            };
 
             for rec_cap in &effective_caps {
+                // `configure_all` enables a capability only on launchers
+                // that support one of its binding types. Resolving one this
+                // launcher cannot bind would configure the capability and
+                // its model without enabling them anywhere, e.g.
+                // `agent-model` from the wildcard config for `bob`, which
+                // supports only `BindingType::Mcp`.
+                let bindable =
+                    CAPABILITY_REGISTRY
+                        .get(&rec_cap.capability)
+                        .is_some_and(|cap_meta| {
+                            cap_meta
+                                .supported_binding_types
+                                .iter()
+                                .any(|bt| launcher_meta.supported_capabilities.contains(bt))
+                        });
+                if !bindable {
+                    continue;
+                }
                 if let Some(resolved) = resolve_capability(
                     &rec_cap.capability,
                     rec_cap,
                     hardware,
-                    &healthy_provider_types,
+                    healthy_provider_types,
                     ctx,
                 ) {
-                    selected_caps.insert(resolved.capability_type.clone());
+                    selection
+                        .capabilities
+                        .insert(resolved.capability_type.clone());
                     for (config_key, (model_id, variant)) in resolved.slots {
                         // Check for conflict from an earlier launcher in the
                         // sorted iteration
-                        if let Some(cap_slots) =
-                            resolved_capability_models.get(&resolved.capability_type)
+                        if let Some(cap_slots) = selection
+                            .resolved_capability_models
+                            .get(&resolved.capability_type)
                             && let Some(existing_model) = cap_slots.get(&config_key)
                             && existing_model != &model_id
                         {
@@ -1378,12 +1450,13 @@ impl SetupCommands {
                             ));
                             continue;
                         }
-                        resolved_capability_models
+                        selection
+                            .resolved_capability_models
                             .entry(resolved.capability_type.clone())
                             .or_default()
                             .insert(config_key.clone(), model_id.clone());
-                        selected_models.insert(model_id.clone());
-                        selected_variants.insert(model_id, variant);
+                        selection.models.insert(model_id.clone());
+                        selection.variants.insert(model_id, variant);
                     }
                 }
             }
@@ -1395,36 +1468,9 @@ impl SetupCommands {
         // previous `Revaluator::for_providers`-based selection worked, since
         // can_run_by is always empty pre-configuration on a first-time
         // setup).
-        for provider_type in &healthy_provider_types {
-            selected_providers.insert(provider_type.clone());
-        }
+        selection.providers = healthy_provider_types.iter().cloned().collect();
 
-        // --auto is non-interactive, so there's no prompt for variant
-        // selection -- `configure_all` falls back to discovery's
-        // hardware-fit `best_variant` for every model.
-        Self::configure_all(
-            ctx,
-            &discovery,
-            &selected_caps,
-            &selected_launchers,
-            &selected_providers,
-            &selected_models,
-            &selected_variants,
-            &resolved_capability_models,
-            &recommended_capability_types_by_launcher,
-        )
-        .await?;
-
-        // Never auto-pull in --auto mode
-        Self::print_summary(
-            ctx,
-            &selected_caps,
-            &selected_launchers,
-            &selected_providers,
-            &selected_models,
-        );
-
-        Ok(())
+        selection
     }
 
     /*-- Selection phases ----------------------------------------------------*/
@@ -4663,6 +4709,56 @@ mod tests {
         };
         assert_eq!(model_of("sub-agent-code"), "granite-4.2-30b");
         assert_eq!(model_of("sub-agent-explore"), "granite-4.2-3b");
+    }
+
+    // -- auto_selection --------------------------------------------------------
+
+    #[test]
+    fn auto_selection_skips_capabilities_the_launcher_cannot_bind() {
+        // bob has no config of its own, so default.yaml applies: agent-model
+        // and vision-mcp. bob supports only BindingType::Mcp, so agent-model
+        // (BindingType::AgentModel) is not selected and its model is not
+        // configured. vision-mcp (BindingType::Mcp) still is.
+        let ctx = test_ctx();
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["bob"]),
+            &["ollama".to_string()],
+            &test_hardware_profile(),
+        );
+
+        assert_eq!(selection.capabilities, string_set(&["vision-mcp"]));
+        assert_eq!(selection.models, string_set(&["granite-vision-4.1-4b"]));
+        assert!(
+            !selection
+                .resolved_capability_models
+                .contains_key("agent-model")
+        );
+        // Still recorded as recommended for bob, so configure_all keeps
+        // treating agent-model as a capability with a recommendation.
+        assert!(selection.recommended_capability_types_by_launcher["bob"].contains("agent-model"));
+    }
+
+    #[test]
+    fn auto_selection_skips_vision_mcp_for_a_launcher_without_mcp() {
+        // pi supports only BindingType::AgentModel. default.yaml's vision-mcp
+        // binds as BindingType::Mcp, so only agent-model is selected.
+        let ctx = test_ctx();
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["pi"]),
+            &["ollama".to_string()],
+            &test_hardware_profile(),
+        );
+
+        assert_eq!(selection.capabilities, string_set(&["agent-model"]));
+        assert!(
+            !selection.models.contains("granite-vision-4.1-4b"),
+            "{:?}",
+            selection.models
+        );
     }
 
     #[test]
