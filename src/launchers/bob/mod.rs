@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 // Third Party
+use alog::{MessageLevel, alog_channel, use_channel};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,8 @@ use crate::utils::subserver::SubServer;
 use crate::utils::ui::Ui;
 
 mod delegate;
+
+use_channel!("BOB");
 
 /*-- public --*/
 
@@ -151,6 +154,7 @@ impl Launcher for BobLauncher {
 
         let mut delegate_server: Option<SubServer> = None;
         let mut all_mcp_bindings: Vec<(String, McpBinding)> = self.bound_mcp_bindings.clone();
+        let mut args = args.to_vec();
         if !self.pending_sub_agents.is_empty() {
             let (binding, server) = delegate::start_delegate_mcp_server(
                 self.pending_sub_agents.clone(),
@@ -159,6 +163,8 @@ impl Launcher for BobLauncher {
                 ui,
             )
             .await?;
+            // Disable internal sub-agents if providing them via MCP
+            args.push("--disable-subagents".to_string());
             all_mcp_bindings.push(("bob-sub-agents".to_string(), binding));
             delegate_server = Some(server);
         }
@@ -168,7 +174,13 @@ impl Launcher for BobLauncher {
             register_mcp_server(&binary, name, binding, SCOPE, ctx, ui)?;
         }
 
-        let result = run_command(binary.clone(), &overlay, args, ctx, ui).await;
+        alog_channel!(
+            MessageLevel::Debug,
+            "Running bob command: {:#?} {:#?}",
+            &binary,
+            &args
+        );
+        let result = run_command(binary.clone(), &overlay, &args, ctx, ui).await;
 
         for (name, _) in &all_mcp_bindings {
             remove_mcp_server(&binary, name, SCOPE, ctx, ui);
