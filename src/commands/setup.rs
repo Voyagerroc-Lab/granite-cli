@@ -834,16 +834,23 @@ fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
     }
 }
 
-/// Check whether a healthy (discoverable) provider type can run a given
-/// variant. Constructs a transient instance with the registry's default
-/// config and calls `can_run_model`, mirroring the pattern used in
-/// `find_can_run_providers` / `candidate_variants`.
-fn provider_can_run(provider_type: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
-    let default_config = PROVIDER_REGISTRY
-        .default_config(provider_type)
-        .unwrap_or_default();
-    PROVIDER_REGISTRY
-        .construct(provider_type, provider_type, &default_config, &ctx.config)
+/// Whether the provider `provider_id` can run `variant`. A provider in
+/// `ctx.config.providers` is constructed from its own config. Any other id is
+/// taken as a provider type found by discovery and constructed with that
+/// type's default config. Same lookup as `candidate_variants`.
+fn provider_can_run(provider_id: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
+    let provider = match ctx.config.get_provider(provider_id) {
+        Some(pc) => {
+            PROVIDER_REGISTRY.construct(&pc.provider_type, &pc.provider_id, &pc.config, &ctx.config)
+        }
+        None => {
+            let default_config = PROVIDER_REGISTRY
+                .default_config(provider_id)
+                .unwrap_or_default();
+            PROVIDER_REGISTRY.construct(provider_id, provider_id, &default_config, &ctx.config)
+        }
+    };
+    provider
         .ok()
         .is_some_and(|p| p.can_run_model(&variant.format, &variant.precision))
 }
@@ -873,10 +880,10 @@ struct AutoSelection {
     recommended_capability_types_by_launcher: HashMap<String, HashSet<String>>,
 }
 
-/// Healthy provider types found among a discovery pass's recommendations --
-/// shared by `run_auto_with_hardware` and `select_capabilities` so both use
-/// the exact same notion of "can actually run something right now" when
-/// deciding whether a recommended capability's model resolves.
+/// Healthy provider types found among a discovery pass's recommendations.
+/// Discovery skips configured providers, so none of them is in the result.
+/// `select_capabilities` resolves recommended capabilities against this list;
+/// `SetupCommands::auto_selection` adds the configured providers to it first.
 fn healthy_provider_types(discovery: &DiscoveryResult) -> Vec<String> {
     discovery
         .recommendations
@@ -972,7 +979,7 @@ fn resolve_capability(
     cap_type: &str,
     rec_cap: &recommended_config::RecommendedCapability,
     hardware: &crate::utils::hardware::HardwareProfile,
-    healthy_provider_types: &[String],
+    provider_ids: &[String],
     ctx: &crate::AppContext,
 ) -> Option<ResolvedCapability> {
     let cap_meta = CAPABILITY_REGISTRY.get(cap_type)?;
@@ -1004,7 +1011,7 @@ fn resolve_capability(
         };
 
         // Resolve this slot against the recommended model set
-        match resolve_model_set(rec_model_set, hardware, healthy_provider_types, ctx) {
+        match resolve_model_set(rec_model_set, hardware, provider_ids, ctx) {
             Some((model_id, variant)) => {
                 result.slots.insert(config_key.clone(), (model_id, variant));
             }
@@ -1031,7 +1038,7 @@ fn resolve_capability(
 fn resolve_model_set(
     set: &recommended_config::RecommendedModelSet,
     hardware: &crate::utils::hardware::HardwareProfile,
-    healthy_provider_types: &[String],
+    provider_ids: &[String],
     ctx: &crate::AppContext,
 ) -> Option<(String, ModelVariant)> {
     for rec_model in &set.models {
@@ -1078,10 +1085,10 @@ fn resolve_model_set(
                     continue;
                 }
 
-                // Check that at least one healthy provider type can run this variant
-                if !healthy_provider_types
+                // Check that at least one provider in `provider_ids` can run this variant
+                if !provider_ids
                     .iter()
-                    .any(|pt| provider_can_run(pt, &variant, ctx))
+                    .any(|id| provider_can_run(id, &variant, ctx))
                 {
                     continue;
                 }
@@ -1362,10 +1369,12 @@ impl SetupCommands {
     }
 
     /// Resolves the recommended config of each launcher in `launchers`
-    /// against `hardware` and `healthy_provider_types`, and returns what
-    /// `run_auto_with_hardware` passes to `configure_all`. A capability in a
+    /// against `hardware`, and returns what `run_auto_with_hardware` passes to
+    /// `configure_all`. Models are resolved against `healthy_provider_types`
+    /// and the providers already in `ctx.config.providers`. A capability in a
     /// launcher's config is resolved only when the launcher supports one of
-    /// the capability's binding types.
+    /// the capability's binding types, and only when `ctx.config.capabilities`
+    /// has no entry with the capability type as its id.
     fn auto_selection(
         ctx: &crate::AppContext,
         launchers: &HashSet<String>,
@@ -1374,6 +1383,19 @@ impl SetupCommands {
     ) -> AutoSelection {
         let ui = &*ctx.ui;
         let mut selection = AutoSelection::default();
+
+        // Discovery health-checks only providers that are not configured, so
+        // `healthy_provider_types` never contains a configured provider.
+        // Configured providers are added here, without a health check.
+        let mut provider_ids: Vec<String> = healthy_provider_types.to_vec();
+        let mut configured_provider_ids: Vec<String> =
+            ctx.config.providers.keys().cloned().collect();
+        configured_provider_ids.sort();
+        for id in configured_provider_ids {
+            if !provider_ids.contains(&id) {
+                provider_ids.push(id);
+            }
+        }
 
         // Iterate launchers in sorted order for determinism, resolving
         // capabilities via the recommended config system.
@@ -1419,13 +1441,15 @@ impl SetupCommands {
                 if !bindable {
                     continue;
                 }
-                if let Some(resolved) = resolve_capability(
-                    &rec_cap.capability,
-                    rec_cap,
-                    hardware,
-                    healthy_provider_types,
-                    ctx,
-                ) {
+                // `configure_all` does not overwrite a configured capability,
+                // so resolving it again would only configure a model that
+                // the capability does not use.
+                if ctx.config.get_capability(&rec_cap.capability).is_some() {
+                    continue;
+                }
+                if let Some(resolved) =
+                    resolve_capability(&rec_cap.capability, rec_cap, hardware, &provider_ids, ctx)
+                {
                     selection
                         .capabilities
                         .insert(resolved.capability_type.clone());
@@ -1462,13 +1486,11 @@ impl SetupCommands {
             }
         }
 
-        // Select every healthy provider type; `configure_all`'s
-        // `find_compatible_provider` picks the actually-compatible one per
-        // model once providers are written to config (mirrors how the
-        // previous `Revaluator::for_providers`-based selection worked, since
-        // can_run_by is always empty pre-configuration on a first-time
-        // setup).
-        selection.providers = healthy_provider_types.iter().cloned().collect();
+        // Select every healthy provider type and every configured provider.
+        // After writing the new providers to config, `configure_all` uses
+        // `find_compatible_provider` to pick, for each model, a provider that
+        // can run its variant. It does not write configured providers again.
+        selection.providers = provider_ids.into_iter().collect();
 
         selection
     }
@@ -2243,6 +2265,12 @@ impl SetupCommands {
         // were *already* configured before this wizard run, and so is
         // always empty on a first-time setup).
         for model_id in selected_models {
+            // A model that is already configured (e.g. by a previous session)
+            // keeps its provider and variant, as the provider, launcher and
+            // capability loops do for their entries.
+            if ctx.config.get_model(model_id).is_some() {
+                continue;
+            }
             ui.info(&format!("\nConfiguring model: {model_id}..."));
 
             // Prefer the variant the user picked in the variant-selection
@@ -4759,6 +4787,97 @@ mod tests {
             "{:?}",
             selection.models
         );
+    }
+
+    #[test]
+    fn auto_selection_resolves_through_a_configured_provider() {
+        // Discovery does not health-check configured providers, so on a
+        // second `setup --auto` run healthy_provider_types can be empty while
+        // an Ollama provider is configured. claude's sub-agent-explore still
+        // resolves, through the configured provider.
+        let ctx = ctx_with_provider(
+            "my-ollama",
+            "ollama",
+            PROVIDER_REGISTRY.default_config("ollama").unwrap(),
+        );
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["claude"]),
+            &[],
+            &test_hardware_profile(),
+        );
+
+        assert_eq!(
+            selection.resolved_capability_models["sub-agent-explore"]["model_id"],
+            "granite-4.2-3b"
+        );
+        assert!(
+            selection.providers.contains("my-ollama"),
+            "{:?}",
+            selection.providers
+        );
+    }
+
+    #[test]
+    fn auto_selection_skips_a_capability_that_is_already_configured() {
+        // sub-agent-explore is configured with another model. configure_all
+        // keeps that entry, so granite-4.2-3b is not selected for it.
+        let mut ctx = test_ctx();
+        ctx.config.capabilities.insert(
+            "sub-agent-explore".to_string(),
+            crate::config::CapabilityConfig {
+                capability_id: "sub-agent-explore".to_string(),
+                capability_type: "sub-agent-explore".to_string(),
+                config: serde_json::json!({"model_id": "my-model"}),
+            },
+        );
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["claude"]),
+            &["ollama".to_string()],
+            &test_hardware_profile(),
+        );
+
+        assert!(!selection.capabilities.contains("sub-agent-explore"));
+        assert!(
+            !selection.models.contains("granite-4.2-3b"),
+            "{:?}",
+            selection.models
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_all_does_not_clobber_a_configured_model() {
+        // setup --auto can select a model that is already configured.
+        // configure_all keeps its provider and variant.
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_model("granite-4.2-3b", Some("my-ollama"));
+        ctx.config.models.get_mut("granite-4.2-3b").unwrap().variant =
+            Some("GGUF/Q4_K_M".to_string());
+        let discovery = run_discovery(&ctx).await;
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &HashSet::new(),
+            &HashSet::new(),
+            &string_set(&["ollama"]),
+            &string_set(&["granite-4.2-3b"]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let saved = ctx
+            .config
+            .get_model("granite-4.2-3b")
+            .expect("model must still be configured");
+        assert_eq!(saved.provider_id, "my-ollama");
+        assert_eq!(saved.variant.as_deref(), Some("GGUF/Q4_K_M"));
     }
 
     #[test]

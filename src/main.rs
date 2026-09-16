@@ -137,6 +137,8 @@ enum Commands {
     Setup {
         /// Auto-detect and configure everything that can be auto-configured.
         /// Consent is implied. Uses registry defaults for all config fields.
+        /// Adds to the existing configuration: an entry that is already
+        /// configured is kept as it is and is not re-checked.
         #[arg(long)]
         auto: bool,
 
