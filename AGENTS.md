@@ -8,3 +8,4 @@
     3. Private functions/structs/enums/etc (mark with `/*-- private --*/` to begin seciton)
     4. Tests (mark with `/*-- tests --*/` to begin seciton)
 - When formatting code, use `./scripts/fmt.sh` which runs both `clippy` and `fmt` with the right versions of the rust toolchain via `rustup`
+- When writing unit tests, nothing should _ever_ depend on the local environment. This includes hardware detection, existence of pre-installed binaries, internet connectivity, and anything else that could differ between development environments
