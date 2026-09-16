@@ -742,184 +742,111 @@ impl OpenCodeLauncher {
         }
     }
 
+    /// Builds a single provider entry value for use in `discover_env_providers`.
+    /// `npm` is the npm package name, `name` is the provider id, `base_url` is
+    /// the well-known base URL, and `api_key_env` is the `{env:VAR}` token.
+    fn make_env_provider_entry(
+        npm: &str,
+        name: &str,
+        base_url: &str,
+        api_key_env: &str,
+    ) -> serde_json::Value {
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "baseURL".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+        options.insert(
+            "apiKey".to_string(),
+            serde_json::Value::String(api_key_env.to_string()),
+        );
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "npm".to_string(),
+            serde_json::Value::String(npm.to_string()),
+        );
+        entry.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        entry.insert("options".to_string(), serde_json::Value::Object(options));
+        serde_json::Value::Object(entry)
+    }
+
     /// Discovers env-based providers by checking for known API key environment
     /// variables. Returns a map of provider name -> provider entry pointing at
     /// the well-known base URL for each provider. These are providers that
     /// OpenCode auto-loads when the corresponding env var is set, but don't
     /// appear explicitly in the user's config files.
+    ///
+    /// The provider list is derived from OpenCode's own provider registry:
+    /// https://github.com/anomalyco/opencode/blob/51f86c853791c41656fb0adcf9413291e4996b87/packages/llm/script/setup-recording-env.ts#L170
+    /// This list should be kept in sync with upstream if new providers are added.
     fn discover_env_providers() -> serde_json::Map<String, serde_json::Value> {
+        // Each tuple: (map key, npm pkg, provider name, base URL, api-key env token)
+        let known: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "openai",
+                "@openai/openai",
+                "openai",
+                "https://api.openai.com/v1",
+                "{env:OPENAI_API_KEY}",
+            ),
+            (
+                "anthropic",
+                "@anthropic-ai/anthropic",
+                "anthropic",
+                "https://api.anthropic.com",
+                "{env:ANTHROPIC_API_KEY}",
+            ),
+            (
+                "google",
+                "@google/generative-ai",
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "{env:GOOGLE_API_KEY}",
+            ),
+            (
+                "groq",
+                "@ai-sdk/openai-compatible",
+                "groq",
+                "https://api.groq.com/openai/v1",
+                "{env:GROQ_API_KEY}",
+            ),
+            (
+                "openrouter",
+                "@ai-sdk/openai-compatible",
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "{env:OPENROUTER_API_KEY}",
+            ),
+            (
+                "cohere",
+                "@ai-sdk/openai-compatible",
+                "cohere",
+                "https://api.cohere.com/v1",
+                "{env:CO_API_KEY}",
+            ),
+            (
+                "mistral",
+                "@ai-sdk/openai-compatible",
+                "mistral",
+                "https://api.mistral.ai/v1",
+                "{env:MISTRAL_API_KEY}",
+            ),
+        ];
+
+        // Extract the env var name from the "{env:VAR}" token (strip "{env:" prefix and "}" suffix)
         let mut providers = serde_json::Map::new();
-
-        // OpenAI
-        if std::env::var("OPENAI_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@openai/openai".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("openai".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String("https://api.openai.com/v1".to_string()),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:OPENAI_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("openai".to_string(), serde_json::Value::Object(entry));
+        for (key, npm, name, base_url, api_key_env) in known {
+            let env_var = &api_key_env[5..api_key_env.len() - 1];
+            if std::env::var(env_var).is_ok() {
+                providers.insert(
+                    key.to_string(),
+                    Self::make_env_provider_entry(npm, name, base_url, api_key_env),
+                );
+            }
         }
-
-        // Anthropic
-        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@anthropic-ai/anthropic".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("anthropic".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String("https://api.anthropic.com".to_string()),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:ANTHROPIC_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("anthropic".to_string(), serde_json::Value::Object(entry));
-        }
-
-        // Google Gemini
-        if std::env::var("GOOGLE_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@google/generative-ai".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("google".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String(
-                    "https://generativelanguage.googleapis.com/v1beta".to_string(),
-                ),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:GOOGLE_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("google".to_string(), serde_json::Value::Object(entry));
-        }
-
-        // Groq
-        if std::env::var("GROQ_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("groq".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String("https://api.groq.com/openai/v1".to_string()),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:GROQ_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("groq".to_string(), serde_json::Value::Object(entry));
-        }
-
-        // OpenRouter
-        if std::env::var("OPENROUTER_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("openrouter".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String("https://openrouter.ai/api/v1".to_string()),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:OPENROUTER_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("openrouter".to_string(), serde_json::Value::Object(entry));
-        }
-
-        // Cohere
-        if std::env::var("CO_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("cohere".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String("https://api.cohere.com/v1".to_string()),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:CO_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("cohere".to_string(), serde_json::Value::Object(entry));
-        }
-
-        // Mistral
-        if std::env::var("MISTRAL_API_KEY").is_ok() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "npm".to_string(),
-                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
-            );
-            entry.insert(
-                "name".to_string(),
-                serde_json::Value::String("mistral".to_string()),
-            );
-            let mut options = serde_json::Map::new();
-            options.insert(
-                "baseURL".to_string(),
-                serde_json::Value::String("https://api.mistral.ai/v1".to_string()),
-            );
-            options.insert(
-                "apiKey".to_string(),
-                serde_json::Value::String("{env:MISTRAL_API_KEY}".to_string()),
-            );
-            entry.insert("options".to_string(), serde_json::Value::Object(options));
-            providers.insert("mistral".to_string(), serde_json::Value::Object(entry));
-        }
-
         providers
     }
 
