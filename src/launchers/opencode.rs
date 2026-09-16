@@ -728,7 +728,7 @@ impl OpenCodeLauncher {
                 continue;
             }
 
-            let label = format!("user-provider-{provider_name}");
+            let label = provider_name.to_string();
             if let Err(e) =
                 proxy_handle.register_provider(provider_name, base_url.to_string(), label)
             {
