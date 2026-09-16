@@ -834,16 +834,23 @@ fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
     }
 }
 
-/// Check whether a healthy (discoverable) provider type can run a given
-/// variant. Constructs a transient instance with the registry's default
-/// config and calls `can_run_model`, mirroring the pattern used in
-/// `find_can_run_providers` / `candidate_variants`.
-fn provider_can_run(provider_type: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
-    let default_config = PROVIDER_REGISTRY
-        .default_config(provider_type)
-        .unwrap_or_default();
-    PROVIDER_REGISTRY
-        .construct(provider_type, provider_type, &default_config, &ctx.config)
+/// Whether the provider `provider_id` can run `variant`. A provider in
+/// `ctx.config.providers` is constructed from its own config. Any other id is
+/// taken as a provider type found by discovery and constructed with that
+/// type's default config. Same lookup as `candidate_variants`.
+fn provider_can_run(provider_id: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
+    let provider = match ctx.config.get_provider(provider_id) {
+        Some(pc) => {
+            PROVIDER_REGISTRY.construct(&pc.provider_type, &pc.provider_id, &pc.config, &ctx.config)
+        }
+        None => {
+            let default_config = PROVIDER_REGISTRY
+                .default_config(provider_id)
+                .unwrap_or_default();
+            PROVIDER_REGISTRY.construct(provider_id, provider_id, &default_config, &ctx.config)
+        }
+    };
+    provider
         .ok()
         .is_some_and(|p| p.can_run_model(&variant.format, &variant.precision))
 }
@@ -857,10 +864,26 @@ struct ResolvedCapability {
     slots: HashMap<String, (String, ModelVariant)>,
 }
 
-/// Healthy provider types found among a discovery pass's recommendations --
-/// shared by `run_auto_with_hardware` and `select_capabilities` so both use
-/// the exact same notion of "can actually run something right now" when
-/// deciding whether a recommended capability's model resolves.
+/// What `setup --auto` passes to `configure_all`, built by
+/// `SetupCommands::auto_selection`.
+#[derive(Default)]
+struct AutoSelection {
+    capabilities: HashSet<String>,
+    models: HashSet<String>,
+    /// model id -> the variant its capability's recommendation resolved to
+    variants: HashMap<String, ModelVariant>,
+    providers: HashSet<String>,
+    /// capability type -> config_key -> model id
+    resolved_capability_models: HashMap<String, HashMap<String, String>>,
+    /// launcher type -> the capability types its recommended config lists,
+    /// whether or not they resolved
+    recommended_capability_types_by_launcher: HashMap<String, HashSet<String>>,
+}
+
+/// Healthy provider types found among a discovery pass's recommendations.
+/// Discovery skips configured providers, so none of them is in the result.
+/// `select_capabilities` resolves recommended capabilities against this list;
+/// `SetupCommands::auto_selection` adds the configured providers to it first.
 fn healthy_provider_types(discovery: &DiscoveryResult) -> Vec<String> {
     discovery
         .recommendations
@@ -956,7 +979,7 @@ fn resolve_capability(
     cap_type: &str,
     rec_cap: &recommended_config::RecommendedCapability,
     hardware: &crate::utils::hardware::HardwareProfile,
-    healthy_provider_types: &[String],
+    provider_ids: &[String],
     ctx: &crate::AppContext,
 ) -> Option<ResolvedCapability> {
     let cap_meta = CAPABILITY_REGISTRY.get(cap_type)?;
@@ -988,7 +1011,7 @@ fn resolve_capability(
         };
 
         // Resolve this slot against the recommended model set
-        match resolve_model_set(rec_model_set, hardware, healthy_provider_types, ctx) {
+        match resolve_model_set(rec_model_set, hardware, provider_ids, ctx) {
             Some((model_id, variant)) => {
                 result.slots.insert(config_key.clone(), (model_id, variant));
             }
@@ -1015,7 +1038,7 @@ fn resolve_capability(
 fn resolve_model_set(
     set: &recommended_config::RecommendedModelSet,
     hardware: &crate::utils::hardware::HardwareProfile,
-    healthy_provider_types: &[String],
+    provider_ids: &[String],
     ctx: &crate::AppContext,
 ) -> Option<(String, ModelVariant)> {
     for rec_model in &set.models {
@@ -1062,10 +1085,10 @@ fn resolve_model_set(
                     continue;
                 }
 
-                // Check that at least one healthy provider type can run this variant
-                if !healthy_provider_types
+                // Check that at least one provider in `provider_ids` can run this variant
+                if !provider_ids
                     .iter()
-                    .any(|pt| provider_can_run(pt, &variant, ctx))
+                    .any(|id| provider_can_run(id, &variant, ctx))
                 {
                     continue;
                 }
@@ -1076,6 +1099,56 @@ fn resolve_model_set(
     }
 
     None
+}
+
+/// The models the wizard binds to the capabilities in `selected_caps`, as
+/// `capability type -> config_key -> model id`, for `configure_all`'s
+/// `resolved_capability_models`. For each model slot, the model is the first
+/// candidate listed in the slot's recommended `RecommendedModelSet.models`
+/// whose catalog id is in `selected_models`. `launcher_types` are read in the
+/// given order, and when two launchers' configs list the same capability, the
+/// first launcher that fills a slot keeps it. A slot with no candidate in
+/// `selected_models` is left out, so `configure_all` falls back to
+/// `find_model_for_capability` for it.
+fn recommended_models_for_selection(
+    ctx: &crate::AppContext,
+    launcher_types: &[String],
+    selected_caps: &HashSet<String>,
+    selected_models: &HashSet<String>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for launcher_type in launcher_types {
+        let effective_caps = recommended_config::effective_capabilities(
+            launcher_type,
+            &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+            &ctx.config.recommended_configs,
+        );
+        for rec_cap in effective_caps {
+            if !selected_caps.contains(&rec_cap.capability) {
+                continue;
+            }
+            for (config_key, set) in &rec_cap.models {
+                if result
+                    .get(&rec_cap.capability)
+                    .is_some_and(|slots| slots.contains_key(config_key))
+                {
+                    continue;
+                }
+                let kept = set
+                    .models
+                    .iter()
+                    .flat_map(|m| matching_catalog_ids(&m.model))
+                    .find(|id| selected_models.contains(id));
+                if let Some(model_id) = kept {
+                    result
+                        .entry(rec_cap.capability.clone())
+                        .or_default()
+                        .insert(config_key.clone(), model_id);
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Whether `md` should be recommended for a capability declaring `req`.
@@ -1181,6 +1254,19 @@ impl SetupCommands {
                     (launcher_type, types)
                 })
                 .collect();
+        // Bind each selected capability to the model its recommended config
+        // lists for it, among the models the user kept in `select_models`.
+        let mut launcher_types: Vec<String> = recommended_capability_types_by_launcher
+            .keys()
+            .cloned()
+            .collect();
+        launcher_types.sort();
+        let resolved_capability_models = recommended_models_for_selection(
+            ctx,
+            &launcher_types,
+            &selected_caps,
+            &selected_models,
+        );
         Self::configure_all(
             ctx,
             &discovery,
@@ -1189,7 +1275,7 @@ impl SetupCommands {
             &selected_providers,
             &selected_models,
             &selected_variants,
-            &HashMap::new(),
+            &resolved_capability_models,
             &recommended_capability_types_by_launcher,
         )
         .await?;
@@ -1251,25 +1337,69 @@ impl SetupCommands {
         // Compute healthy provider types from discovery recommendations
         let healthy_provider_types = healthy_provider_types(&discovery);
 
+        let selection =
+            Self::auto_selection(ctx, &selected_launchers, &healthy_provider_types, hardware);
+
+        // --auto is non-interactive, so there's no prompt for variant
+        // selection -- `configure_all` falls back to discovery's
+        // hardware-fit `best_variant` for every model.
+        Self::configure_all(
+            ctx,
+            &discovery,
+            &selection.capabilities,
+            &selected_launchers,
+            &selection.providers,
+            &selection.models,
+            &selection.variants,
+            &selection.resolved_capability_models,
+            &selection.recommended_capability_types_by_launcher,
+        )
+        .await?;
+
+        // Never auto-pull in --auto mode
+        Self::print_summary(
+            ctx,
+            &selection.capabilities,
+            &selected_launchers,
+            &selection.providers,
+            &selection.models,
+        );
+
+        Ok(())
+    }
+
+    /// Resolves the recommended config of each launcher in `launchers`
+    /// against `hardware`, and returns what `run_auto_with_hardware` passes to
+    /// `configure_all`. Models are resolved against `healthy_provider_types`
+    /// and the providers already in `ctx.config.providers`. A capability in a
+    /// launcher's config is resolved only when the launcher supports one of
+    /// the capability's binding types, and only when `ctx.config.capabilities`
+    /// has no entry with the capability type as its id.
+    fn auto_selection(
+        ctx: &crate::AppContext,
+        launchers: &HashSet<String>,
+        healthy_provider_types: &[String],
+        hardware: &HardwareProfile,
+    ) -> AutoSelection {
+        let ui = &*ctx.ui;
+        let mut selection = AutoSelection::default();
+
+        // Discovery health-checks only providers that are not configured, so
+        // `healthy_provider_types` never contains a configured provider.
+        // Configured providers are added here, without a health check.
+        let mut provider_ids: Vec<String> = healthy_provider_types.to_vec();
+        let mut configured_provider_ids: Vec<String> =
+            ctx.config.providers.keys().cloned().collect();
+        configured_provider_ids.sort();
+        for id in configured_provider_ids {
+            if !provider_ids.contains(&id) {
+                provider_ids.push(id);
+            }
+        }
+
         // Iterate launchers in sorted order for determinism, resolving
         // capabilities via the recommended config system.
-        let mut selected_caps: HashSet<String> = HashSet::new();
-        let mut selected_models: HashSet<String> = HashSet::new();
-        let mut selected_variants: HashMap<String, ModelVariant> = HashMap::new();
-        let mut selected_providers: HashSet<String> = HashSet::new();
-        let mut resolved_capability_models: HashMap<String, HashMap<String, String>> =
-            HashMap::new();
-        // launcher_type -> capability_types that launcher's own effective
-        // config lists, whether or not resolution for it succeeded --
-        // recorded regardless of outcome, since it reflects the launcher's
-        // own curated intent, not just what happened to resolve. Passed to
-        // `configure_all` so a capability recommended for one launcher
-        // never gets enabled on a different one just because their binding
-        // types happen to overlap too.
-        let mut recommended_capability_types_by_launcher: HashMap<String, HashSet<String>> =
-            HashMap::new();
-
-        let mut sorted_launchers: Vec<String> = selected_launchers.iter().cloned().collect();
+        let mut sorted_launchers: Vec<String> = launchers.iter().cloned().collect();
         sorted_launchers.sort();
 
         for launcher_type in &sorted_launchers {
@@ -1278,28 +1408,57 @@ impl SetupCommands {
                 &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
                 &ctx.config.recommended_configs,
             );
-            recommended_capability_types_by_launcher.insert(
+            // Recorded before the binding check below: `configure_all`
+            // reads it to decide which launchers a capability is
+            // recommended for.
+            selection.recommended_capability_types_by_launcher.insert(
                 launcher_type.clone(),
                 effective_caps
                     .iter()
                     .map(|c| c.capability.clone())
                     .collect(),
             );
+            let Some(launcher_meta) = LAUNCHER_REGISTRY.get(launcher_type) else {
+                continue;
+            };
 
             for rec_cap in &effective_caps {
-                if let Some(resolved) = resolve_capability(
-                    &rec_cap.capability,
-                    rec_cap,
-                    hardware,
-                    &healthy_provider_types,
-                    ctx,
-                ) {
-                    selected_caps.insert(resolved.capability_type.clone());
+                // `configure_all` enables a capability only on launchers
+                // that support one of its binding types. Resolving one this
+                // launcher cannot bind would configure the capability and
+                // its model without enabling them anywhere, e.g.
+                // `agent-model` from the wildcard config for `bob`, which
+                // supports only `BindingType::Mcp`.
+                let bindable =
+                    CAPABILITY_REGISTRY
+                        .get(&rec_cap.capability)
+                        .is_some_and(|cap_meta| {
+                            cap_meta
+                                .supported_binding_types
+                                .iter()
+                                .any(|bt| launcher_meta.supported_capabilities.contains(bt))
+                        });
+                if !bindable {
+                    continue;
+                }
+                // `configure_all` does not overwrite a configured capability,
+                // so resolving it again would only configure a model that
+                // the capability does not use.
+                if ctx.config.get_capability(&rec_cap.capability).is_some() {
+                    continue;
+                }
+                if let Some(resolved) =
+                    resolve_capability(&rec_cap.capability, rec_cap, hardware, &provider_ids, ctx)
+                {
+                    selection
+                        .capabilities
+                        .insert(resolved.capability_type.clone());
                     for (config_key, (model_id, variant)) in resolved.slots {
                         // Check for conflict from an earlier launcher in the
                         // sorted iteration
-                        if let Some(cap_slots) =
-                            resolved_capability_models.get(&resolved.capability_type)
+                        if let Some(cap_slots) = selection
+                            .resolved_capability_models
+                            .get(&resolved.capability_type)
                             && let Some(existing_model) = cap_slots.get(&config_key)
                             && existing_model != &model_id
                         {
@@ -1315,53 +1474,25 @@ impl SetupCommands {
                             ));
                             continue;
                         }
-                        resolved_capability_models
+                        selection
+                            .resolved_capability_models
                             .entry(resolved.capability_type.clone())
                             .or_default()
                             .insert(config_key.clone(), model_id.clone());
-                        selected_models.insert(model_id.clone());
-                        selected_variants.insert(model_id, variant);
+                        selection.models.insert(model_id.clone());
+                        selection.variants.insert(model_id, variant);
                     }
                 }
             }
         }
 
-        // Select every healthy provider type; `configure_all`'s
-        // `find_compatible_provider` picks the actually-compatible one per
-        // model once providers are written to config (mirrors how the
-        // previous `Revaluator::for_providers`-based selection worked, since
-        // can_run_by is always empty pre-configuration on a first-time
-        // setup).
-        for provider_type in &healthy_provider_types {
-            selected_providers.insert(provider_type.clone());
-        }
+        // Select every healthy provider type and every configured provider.
+        // After writing the new providers to config, `configure_all` uses
+        // `find_compatible_provider` to pick, for each model, a provider that
+        // can run its variant. It does not write configured providers again.
+        selection.providers = provider_ids.into_iter().collect();
 
-        // --auto is non-interactive, so there's no prompt for variant
-        // selection -- `configure_all` falls back to discovery's
-        // hardware-fit `best_variant` for every model.
-        Self::configure_all(
-            ctx,
-            &discovery,
-            &selected_caps,
-            &selected_launchers,
-            &selected_providers,
-            &selected_models,
-            &selected_variants,
-            &resolved_capability_models,
-            &recommended_capability_types_by_launcher,
-        )
-        .await?;
-
-        // Never auto-pull in --auto mode
-        Self::print_summary(
-            ctx,
-            &selected_caps,
-            &selected_launchers,
-            &selected_providers,
-            &selected_models,
-        );
-
-        Ok(())
+        selection
     }
 
     /*-- Selection phases ----------------------------------------------------*/
@@ -2134,6 +2265,12 @@ impl SetupCommands {
         // were *already* configured before this wizard run, and so is
         // always empty on a first-time setup).
         for model_id in selected_models {
+            // A model that is already configured (e.g. by a previous session)
+            // keeps its provider and variant, as the provider, launcher and
+            // capability loops do for their entries.
+            if ctx.config.get_model(model_id).is_some() {
+                continue;
+            }
             ui.info(&format!("\nConfiguring model: {model_id}..."));
 
             // Prefer the variant the user picked in the variant-selection
@@ -2179,53 +2316,24 @@ impl SetupCommands {
 
         // Configure capabilities
         for cap_type in selected_caps {
-            let cap_meta = CAPABILITY_REGISTRY.get(cap_type);
-            let needs_model = cap_meta.as_ref().is_some_and(|meta| {
-                meta.dependencies
-                    .iter()
-                    .any(|d| matches!(d, Dependency::Model { required: true, .. }))
-            });
+            let dependencies = CAPABILITY_REGISTRY
+                .get(cap_type)
+                .map(|meta| meta.dependencies)
+                .unwrap_or_default();
 
-            // Iterate over the capability's model dependencies and resolve
-            // each one: precise mapping wins when present (from
-            // resolved_capability_models), otherwise fall back to the
-            // existing heuristic via find_model_for_capability.
-            let mut cap_model_ids: HashMap<String, String> = HashMap::new();
-            if let Some(meta) = cap_meta.as_ref() {
-                for dep in &meta.dependencies {
-                    let Dependency::Model {
-                        config_key,
-                        required,
-                        ..
-                    } = dep
-                    else {
-                        continue;
-                    };
-                    let model_id = resolved_capability_models
-                        .get(cap_type)
-                        .and_then(|slots| slots.get(config_key.as_str()).cloned())
-                        .or_else(|| Self::find_model_for_capability(cap_type, selected_models));
-
-                    if let Some(id) = model_id {
-                        cap_model_ids.insert(config_key.clone(), id);
-                    } else if *required {
-                        // A required model dependency has no match -- skip this
-                        // capability to avoid panics in CapabilitySource.
-                        ui.warn(&format!(
-                            "Skipping '{cap_type}': no compatible model available."
-                        ));
-                        continue;
-                    }
-                }
-            }
-
-            // Re-check: if we needed a model but found none at all, skip
-            if needs_model && cap_model_ids.is_empty() {
+            // `CapabilitySource` skips a capability whose required model slot
+            // is empty, with a warning, so such a capability is not written.
+            let Some(cap_model_ids) = Self::capability_model_ids(
+                cap_type,
+                &dependencies,
+                resolved_capability_models,
+                selected_models,
+            ) else {
                 ui.warn(&format!(
                     "Skipping '{cap_type}': no compatible model available."
                 ));
                 continue;
-            }
+            };
 
             // An id already configured (e.g. via a previous session or an
             // escape-hatch wizard invoked earlier in this same run) must be
@@ -2351,8 +2459,45 @@ impl SetupCommands {
             .cloned()
     }
 
+    /// The model id for each model slot in `dependencies`, keyed by the
+    /// slot's `config_key`. A slot gets the model `resolved_capability_models`
+    /// lists for `cap_type` and that `config_key`, otherwise the result of
+    /// `find_model_for_capability`. An optional slot with no model is left
+    /// out. Returns `None` when any required slot has no model.
+    fn capability_model_ids(
+        cap_type: &str,
+        dependencies: &[Dependency],
+        resolved_capability_models: &HashMap<String, HashMap<String, String>>,
+        selected_models: &HashSet<String>,
+    ) -> Option<HashMap<String, String>> {
+        let mut model_ids = HashMap::new();
+        for dep in dependencies {
+            let Dependency::Model {
+                config_key,
+                required,
+                ..
+            } = dep
+            else {
+                continue;
+            };
+            let model_id = resolved_capability_models
+                .get(cap_type)
+                .and_then(|slots| slots.get(config_key.as_str()).cloned())
+                .or_else(|| Self::find_model_for_capability(cap_type, selected_models));
+            match model_id {
+                Some(id) => {
+                    model_ids.insert(config_key.clone(), id);
+                }
+                None if *required => return None,
+                None => {}
+            }
+        }
+        Some(model_ids)
+    }
+
     /// Find a model_id from selected_models that satisfies a capability's model
-    /// requirement. Returns the first matching model or None if no match.
+    /// requirement. Returns the first matching model id in sorted order, or
+    /// None if no model matches.
     fn find_model_for_capability(
         cap_type: &str,
         selected_models: &HashSet<String>,
@@ -2377,9 +2522,12 @@ impl SetupCommands {
         }
 
         // Check each selected model's real catalog metadata to see if it
-        // satisfies any requirement.
-        selected_models
-            .iter()
+        // satisfies any requirement. Sorted, so the result does not depend on
+        // the iteration order of `selected_models`, which changes between runs.
+        let mut candidates: Vec<&String> = selected_models.iter().collect();
+        candidates.sort();
+        candidates
+            .into_iter()
             .find(|model_id| {
                 MODEL_REGISTRY.get(model_id).is_some_and(|md| {
                     all_requirements
@@ -4461,5 +4609,397 @@ mod tests {
             saved.config["custom_field"], custom_config_val,
             "configure_all must not overwrite a manually configured capability's custom config"
         );
+    }
+
+    // -- Wizard model binding --------------------------------------------------
+
+    fn string_set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn recommended_models_for_selection_binds_each_capability_to_its_listed_model() {
+        // claude.yaml lists granite-4.2-30b for sub-agent-code and
+        // granite-4.2-3b for sub-agent-explore. With both models kept, each
+        // capability gets the model listed for it.
+        let ctx = test_ctx();
+        let caps = string_set(&["sub-agent-code", "sub-agent-explore"]);
+        let models = string_set(&["granite-4.2-30b", "granite-4.2-3b"]);
+
+        let resolved =
+            recommended_models_for_selection(&ctx, &["claude".to_string()], &caps, &models);
+
+        assert_eq!(resolved["sub-agent-code"]["model_id"], "granite-4.2-30b");
+        assert_eq!(resolved["sub-agent-explore"]["model_id"], "granite-4.2-3b");
+    }
+
+    #[test]
+    fn recommended_models_for_selection_leaves_out_a_slot_with_no_kept_candidate() {
+        // claude.yaml lists only granite-4.2-30b for sub-agent-code. With only
+        // granite-4.2-3b kept, sub-agent-code gets no entry, so configure_all
+        // uses find_model_for_capability for it.
+        let ctx = test_ctx();
+        let caps = string_set(&["sub-agent-code", "sub-agent-explore"]);
+        let models = string_set(&["granite-4.2-3b"]);
+
+        let resolved =
+            recommended_models_for_selection(&ctx, &["claude".to_string()], &caps, &models);
+
+        assert!(!resolved.contains_key("sub-agent-code"), "{resolved:?}");
+        assert_eq!(resolved["sub-agent-explore"]["model_id"], "granite-4.2-3b");
+    }
+
+    #[test]
+    fn recommended_models_for_selection_uses_the_first_kept_candidate_in_config_order() {
+        // goose has no config of its own, so default.yaml applies. Its
+        // agent-model entry lists granite-4.2-30b before granite-4.2-8b and
+        // does not list granite-4.2-3b. Issue #129 reported agent-model bound
+        // to a 3b model.
+        let ctx = test_ctx();
+        let caps = string_set(&["agent-model"]);
+        let models = string_set(&["granite-4.2-3b", "granite-4.2-8b", "granite-4.2-30b"]);
+
+        let resolved =
+            recommended_models_for_selection(&ctx, &["goose".to_string()], &caps, &models);
+
+        assert_eq!(resolved["agent-model"]["model_id"], "granite-4.2-30b");
+    }
+
+    #[test]
+    fn recommended_models_for_selection_keeps_the_first_launchers_model_for_a_shared_capability() {
+        // claude.yaml lists granite-4.2-30b for sub-agent-code; a user config
+        // for opencode lists granite-4.2-8b. The launchers are read in the
+        // order given, so claude's model is kept.
+        let mut ctx = test_ctx();
+        ctx.config.recommended_configs.insert(
+            "opencode".to_string(),
+            recommended_config::RecommendedConfiguration {
+                launcher: "opencode".to_string(),
+                capabilities: vec![recommended_config::RecommendedCapability {
+                    capability: "sub-agent-code".to_string(),
+                    models: HashMap::from([(
+                        "model_id".to_string(),
+                        recommended_config::RecommendedModelSet {
+                            min_context_length: None,
+                            models: vec![recommended_config::RecommendedModel {
+                                model: recommended_config::StringMatch::Exact(
+                                    "granite-4.2-8b".to_string(),
+                                ),
+                                variant_formats: vec![],
+                                variant_precisions: vec![],
+                            }],
+                        },
+                    )]),
+                }],
+            },
+        );
+        let caps = string_set(&["sub-agent-code"]);
+        let models = string_set(&["granite-4.2-8b", "granite-4.2-30b"]);
+
+        let resolved = recommended_models_for_selection(
+            &ctx,
+            &["claude".to_string(), "opencode".to_string()],
+            &caps,
+            &models,
+        );
+
+        assert_eq!(resolved["sub-agent-code"]["model_id"], "granite-4.2-30b");
+    }
+
+    #[tokio::test]
+    async fn configure_all_binds_wizard_capabilities_to_their_recommended_models() {
+        // run_wizard passes recommended_models_for_selection's result to
+        // configure_all. With an empty map, both capabilities got the same
+        // model, whichever find_model_for_capability returned.
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let discovery = run_discovery(&ctx).await;
+        let launchers = string_set(&["claude"]);
+        let caps = string_set(&["sub-agent-code", "sub-agent-explore"]);
+        let models = string_set(&["granite-4.2-30b", "granite-4.2-3b"]);
+        let providers = string_set(&["ollama"]);
+        let resolved =
+            recommended_models_for_selection(&ctx, &["claude".to_string()], &caps, &models);
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &caps,
+            &launchers,
+            &providers,
+            &models,
+            &HashMap::new(),
+            &resolved,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let model_of = |id: &str| {
+            ctx.config
+                .get_capability(id)
+                .unwrap_or_else(|| panic!("{id} should be configured"))
+                .config["model_id"]
+                .clone()
+        };
+        assert_eq!(model_of("sub-agent-code"), "granite-4.2-30b");
+        assert_eq!(model_of("sub-agent-explore"), "granite-4.2-3b");
+    }
+
+    // -- auto_selection --------------------------------------------------------
+
+    #[test]
+    fn auto_selection_skips_capabilities_the_launcher_cannot_bind() {
+        // bob has no config of its own, so default.yaml applies: agent-model
+        // and vision-mcp. bob supports only BindingType::Mcp, so agent-model
+        // (BindingType::AgentModel) is not selected and its model is not
+        // configured. vision-mcp (BindingType::Mcp) still is.
+        let ctx = test_ctx();
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["bob"]),
+            &["ollama".to_string()],
+            &test_hardware_profile(),
+        );
+
+        assert_eq!(selection.capabilities, string_set(&["vision-mcp"]));
+        assert_eq!(selection.models, string_set(&["granite-vision-4.1-4b"]));
+        assert!(
+            !selection
+                .resolved_capability_models
+                .contains_key("agent-model")
+        );
+        // Still recorded as recommended for bob, so configure_all keeps
+        // treating agent-model as a capability with a recommendation.
+        assert!(selection.recommended_capability_types_by_launcher["bob"].contains("agent-model"));
+    }
+
+    #[test]
+    fn auto_selection_skips_vision_mcp_for_a_launcher_without_mcp() {
+        // pi supports only BindingType::AgentModel. default.yaml's vision-mcp
+        // binds as BindingType::Mcp, so only agent-model is selected.
+        let ctx = test_ctx();
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["pi"]),
+            &["ollama".to_string()],
+            &test_hardware_profile(),
+        );
+
+        assert_eq!(selection.capabilities, string_set(&["agent-model"]));
+        assert!(
+            !selection.models.contains("granite-vision-4.1-4b"),
+            "{:?}",
+            selection.models
+        );
+    }
+
+    #[test]
+    fn auto_selection_resolves_through_a_configured_provider() {
+        // Discovery does not health-check configured providers, so on a
+        // second `setup --auto` run healthy_provider_types can be empty while
+        // an Ollama provider is configured. claude's sub-agent-explore still
+        // resolves, through the configured provider.
+        let ctx = ctx_with_provider(
+            "my-ollama",
+            "ollama",
+            PROVIDER_REGISTRY.default_config("ollama").unwrap(),
+        );
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["claude"]),
+            &[],
+            &test_hardware_profile(),
+        );
+
+        assert_eq!(
+            selection.resolved_capability_models["sub-agent-explore"]["model_id"],
+            "granite-4.2-3b"
+        );
+        assert!(
+            selection.providers.contains("my-ollama"),
+            "{:?}",
+            selection.providers
+        );
+    }
+
+    #[test]
+    fn auto_selection_skips_a_capability_that_is_already_configured() {
+        // sub-agent-explore is configured with another model. configure_all
+        // keeps that entry, so granite-4.2-3b is not selected for it.
+        let mut ctx = test_ctx();
+        ctx.config.capabilities.insert(
+            "sub-agent-explore".to_string(),
+            crate::config::CapabilityConfig {
+                capability_id: "sub-agent-explore".to_string(),
+                capability_type: "sub-agent-explore".to_string(),
+                config: serde_json::json!({"model_id": "my-model"}),
+            },
+        );
+
+        let selection = SetupCommands::auto_selection(
+            &ctx,
+            &string_set(&["claude"]),
+            &["ollama".to_string()],
+            &test_hardware_profile(),
+        );
+
+        assert!(!selection.capabilities.contains("sub-agent-explore"));
+        assert!(
+            !selection.models.contains("granite-4.2-3b"),
+            "{:?}",
+            selection.models
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_all_does_not_clobber_a_configured_model() {
+        // setup --auto can select a model that is already configured.
+        // configure_all keeps its provider and variant.
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_model("granite-4.2-3b", Some("my-ollama"));
+        ctx.config.models.get_mut("granite-4.2-3b").unwrap().variant =
+            Some("GGUF/Q4_K_M".to_string());
+        let discovery = run_discovery(&ctx).await;
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &HashSet::new(),
+            &HashSet::new(),
+            &string_set(&["ollama"]),
+            &string_set(&["granite-4.2-3b"]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let saved = ctx
+            .config
+            .get_model("granite-4.2-3b")
+            .expect("model must still be configured");
+        assert_eq!(saved.provider_id, "my-ollama");
+        assert_eq!(saved.variant.as_deref(), Some("GGUF/Q4_K_M"));
+    }
+
+    // -- capability_model_ids --------------------------------------------------
+
+    fn model_dependency(config_key: &str, required: bool) -> Dependency {
+        Dependency::Model {
+            config_key: config_key.to_string(),
+            requirement: ModelRequirement::default(),
+            resolved_id: None,
+            required,
+        }
+    }
+
+    #[test]
+    fn capability_model_ids_is_none_when_one_of_two_required_slots_is_empty() {
+        // No registered capability has two model slots, so this uses a
+        // capability type that is not registered: find_model_for_capability
+        // returns None for it, and only `model_id` has a model.
+        let dependencies = [
+            model_dependency("model_id", true),
+            model_dependency("draft_model_id", true),
+        ];
+        let resolved: HashMap<String, HashMap<String, String>> = HashMap::from([(
+            "two-slot-test".to_string(),
+            HashMap::from([("model_id".to_string(), "granite-4.2-8b".to_string())]),
+        )]);
+
+        let model_ids = SetupCommands::capability_model_ids(
+            "two-slot-test",
+            &dependencies,
+            &resolved,
+            &HashSet::new(),
+        );
+
+        assert_eq!(model_ids, None);
+    }
+
+    #[test]
+    fn capability_model_ids_leaves_out_an_empty_optional_slot() {
+        let dependencies = [
+            model_dependency("model_id", true),
+            model_dependency("draft_model_id", false),
+        ];
+        let resolved: HashMap<String, HashMap<String, String>> = HashMap::from([(
+            "two-slot-test".to_string(),
+            HashMap::from([("model_id".to_string(), "granite-4.2-8b".to_string())]),
+        )]);
+
+        let model_ids = SetupCommands::capability_model_ids(
+            "two-slot-test",
+            &dependencies,
+            &resolved,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            model_ids,
+            Some(HashMap::from([(
+                "model_id".to_string(),
+                "granite-4.2-8b".to_string()
+            )]))
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_all_warns_once_for_a_capability_without_a_model() {
+        // agent-model has one required slot and no model is selected. The
+        // capability is skipped with one warning; before, the same warning
+        // was printed twice.
+        let _home = crate::config::TestConfigHome::new();
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext {
+            config: Config::default(),
+            ui: capture.clone(),
+        };
+        let discovery = DiscoveryResult {
+            recommendations: vec![],
+            all_model_candidates: vec![],
+            configured_provider_ids: vec![],
+            configured_model_ids: vec![],
+            configured_launcher_ids: vec![],
+            configured_capability_ids: vec![],
+        };
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &string_set(&["agent-model"]),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *capture.warns.borrow(),
+            vec!["Skipping 'agent-model': no compatible model available.".to_string()]
+        );
+        assert!(ctx.config.get_capability("agent-model").is_none());
+    }
+
+    #[test]
+    fn find_model_for_capability_returns_the_first_match_in_sorted_order() {
+        // Each iteration builds a new HashSet, and each HashSet iterates in a
+        // different order. The result must not change.
+        for _ in 0..20 {
+            let models = string_set(&["granite-4.2-8b", "granite-4.2-3b", "granite-4.2-30b"]);
+            assert_eq!(
+                SetupCommands::find_model_for_capability("sub-agent-code", &models),
+                Some("granite-4.2-30b".to_string())
+            );
+        }
     }
 }
