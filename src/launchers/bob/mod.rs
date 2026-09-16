@@ -312,6 +312,7 @@ mod tests {
             Ok(Binding::Mcp(McpBinding::Http {
                 url: "http://127.0.0.1:1/mcp".to_string(),
                 headers: Default::default(),
+                timeout: None,
             }))
         }
     }

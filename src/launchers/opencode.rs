@@ -549,7 +549,9 @@ fn generate_config(
         for (name, binding) in mcp_bindings {
             mcp.insert(name.clone(), {
                 match binding {
-                    McpBinding::Stdio { command, args, env } => {
+                    McpBinding::Stdio {
+                        command, args, env, ..
+                    } => {
                         let mut full_command = vec![command.clone()];
                         full_command.extend(args.iter().cloned());
                         serde_json::json!({
@@ -558,7 +560,8 @@ fn generate_config(
                             "environment": env,
                         })
                     }
-                    McpBinding::Http { url, headers } | McpBinding::Sse { url, headers } => {
+                    McpBinding::Http { url, headers, .. }
+                    | McpBinding::Sse { url, headers, .. } => {
                         serde_json::json!({
                             "type": "remote",
                             "url": url,
@@ -1074,6 +1077,7 @@ mod tests {
         let mcp_binding = McpBinding::Http {
             url: "http://127.0.0.1:9999".to_string(),
             headers: Default::default(),
+            timeout: None,
         };
         let config = generate_config(
             None,
