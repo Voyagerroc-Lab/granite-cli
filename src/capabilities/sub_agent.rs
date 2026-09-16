@@ -84,18 +84,6 @@ macro_rules! declare_sub_agent_basic {
                 $description_cap
             }
 
-            fn dependencies(&self) -> Vec<$crate::capabilities::Dependency> {
-                vec![$crate::capabilities::Dependency::Model {
-                    config_key: "model_id".to_string(),
-                    requirement: $crate::capabilities::ModelRequirement {
-                        supported_functions: vec![$crate::models::ModelFunction::Chat, $crate::models::ModelFunction::ToolCalling],
-                        ..Default::default()
-                    },
-                    resolved_id: Some(self.config.model_id.clone()),
-                    required: true,
-                }]
-            }
-
             fn binding_types(&self) -> std::collections::HashSet<$crate::capabilities::base::BindingType> {
                 std::collections::HashSet::from([$crate::capabilities::base::BindingType::SubAgent])
             }
@@ -129,6 +117,7 @@ macro_rules! declare_sub_agent_basic {
                         api_key: provider.api_key().cloned(),
                         verify_ssl: provider.verify_ssl(),
                         context_length: Some(self.configured_model.model.context_length()),
+                        custom_headers: provider.custom_headers(),
                     },
                     known_type: $known_type,
                 }))
@@ -238,18 +227,6 @@ macro_rules! declare_sub_agent_full {
                 $description_cap
             }
 
-            fn dependencies(&self) -> Vec<$crate::capabilities::Dependency> {
-                vec![$crate::capabilities::Dependency::Model {
-                    config_key: "model_id".to_string(),
-                    requirement: $crate::capabilities::ModelRequirement {
-                        supported_functions: vec![$crate::models::ModelFunction::Chat, $crate::models::ModelFunction::ToolCalling],
-                        ..Default::default()
-                    },
-                    resolved_id: Some(self.config.model_id.clone()),
-                    required: true,
-                }]
-            }
-
             fn binding_types(&self) -> std::collections::HashSet<$crate::capabilities::base::BindingType> {
                 std::collections::HashSet::from([$crate::capabilities::base::BindingType::SubAgent])
             }
@@ -283,6 +260,7 @@ macro_rules! declare_sub_agent_full {
                         api_key: provider.api_key().cloned(),
                         verify_ssl: provider.verify_ssl(),
                         context_length: Some(self.configured_model.model.context_length()),
+                        custom_headers: provider.custom_headers(),
                     },
                     known_type: $known_type,
                 }))
@@ -396,10 +374,17 @@ mod tests {
         fn verify_ssl(&self) -> bool {
             self.verify_ssl
         }
+        fn custom_headers(&self) -> Option<std::collections::HashMap<String, Secret>> {
+            None
+        }
         fn supported_formats(&self) -> Vec<ModelFormat> {
             vec![]
         }
-        fn model_alias(&self, _variant: Option<&crate::models::ModelVariant>) -> Option<String> {
+        fn model_alias(
+            &self,
+            _model_id: String,
+            _variant: Option<&crate::models::ModelVariant>,
+        ) -> Option<String> {
             self.alias.clone()
         }
         async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
@@ -495,7 +480,7 @@ mod tests {
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
-                provider_id: None,
+                provider_id: "ollama".to_string(),
                 variant: None,
             },
         );
@@ -537,7 +522,7 @@ mod tests {
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
-                provider_id: None,
+                provider_id: "ollama".to_string(),
                 variant: None,
             },
         );
@@ -634,13 +619,12 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_carry_resolved_model_id() {
-        let cap = capability_with_test_model(vec![ModelFunction::Chat], ok_provider());
-        let deps = cap.dependencies();
+    fn metadata_declares_a_required_model_dependency() {
+        let deps = SubAgentCapability::metadata().dependencies;
         assert_eq!(deps.len(), 1);
         assert!(deps.iter().any(|d| matches!(
             d,
-            Dependency::Model { resolved_id: Some(id), .. } if id == "granite-3.1-8b-instruct"
+            Dependency::Model { config_key, required: true, .. } if config_key == "model_id"
         )));
     }
 

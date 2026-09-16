@@ -10,9 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use_channel!("CONF");
 
+pub(crate) mod recommended_config;
+pub(crate) mod validation;
+
 const PATH_DELIM: &str = "---";
 
-trait ConfigId {
+pub(crate) trait ConfigId {
     fn config_id(&self) -> &str;
 }
 
@@ -40,12 +43,25 @@ impl ConfigId for LauncherConfig {
     }
 }
 
+impl ConfigId for recommended_config::RecommendedConfiguration {
+    fn config_id(&self) -> &str {
+        &self.launcher
+    }
+}
+
+impl ConfigPathTranslator for recommended_config::RecommendedConfiguration {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     pub providers: HashMap<String, ProviderConfig>,
     pub capabilities: HashMap<String, CapabilityConfig>,
     pub launchers: HashMap<String, LauncherConfig>,
+    pub recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
     /// Ephemeral handle to the session-scoped model proxy for the current
     /// `launch` invocation, set whenever `-u`/`--usage-tracking` is enabled
     /// or a bound capability needs sub-agent routing. Never persisted --
@@ -66,7 +82,7 @@ pub struct ModelConfig {
     /// Registry key: the catalog id this instance was constructed from (a
     /// `resources/models.yaml` id, or `"custom"`).
     pub model_type: String,
-    pub provider_id: Option<String>,
+    pub provider_id: String,
     pub variant: Option<String>,
     /// Model-type-specific config (e.g. `CustomModelConfig`'s fields for a
     /// `"custom"` instance). `{}` for catalog models, which take no config
@@ -365,6 +381,10 @@ impl Config {
         Ok(Self::config_dir()?.join("launchers"))
     }
 
+    fn recommended_configs_dir() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("recommended_configs"))
+    }
+
     /// Directory a launcher may materialize generated state into -- config files
     /// it must put on disk for the tool it wraps. Kept under `GRANITE_CLI_HOME`
     /// so wrapping a tool never means editing that tool's own global config.
@@ -387,6 +407,7 @@ impl Config {
         fs::create_dir_all(Self::providers_dir()?)?;
         fs::create_dir_all(Self::capabilities_dir()?)?;
         fs::create_dir_all(Self::launchers_dir()?)?;
+        fs::create_dir_all(Self::recommended_configs_dir()?)?;
         Ok(())
     }
 
@@ -424,24 +445,29 @@ impl Config {
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if let Ok(mut config) = Self::load_yaml_from_file::<V>(&path) {
-                    if let Some(cfg) = config.config_mut() {
-                        translate_paths_in_config(cfg, true);
+                let mut config = match Self::load_yaml_from_file::<V>(&path) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        alog_channel!(MessageLevel::Warning, "Skipping config file: {:#}", e);
+                        continue;
                     }
-                    let id = config.config_id().to_string();
-                    let file_id = Self::id_from_filename(&file_name);
-                    if id != file_id {
-                        let type_name = std::any::type_name::<V>();
-                        alog_channel!(
-                            MessageLevel::Warning,
-                            "Found invalid config file {} with id \"{}\" (type: {})",
-                            file_id,
-                            id,
-                            type_name
-                        );
-                    } else {
-                        map.insert(into_key(&id), config);
-                    }
+                };
+                if let Some(cfg) = config.config_mut() {
+                    translate_paths_in_config(cfg, true);
+                }
+                let id = config.config_id().to_string();
+                let file_id = Self::id_from_filename(&file_name);
+                if id != file_id {
+                    let type_name = std::any::type_name::<V>();
+                    alog_channel!(
+                        MessageLevel::Warning,
+                        "Found invalid config file {} with id \"{}\" (type: {})",
+                        file_id,
+                        id,
+                        type_name
+                    );
+                } else {
+                    map.insert(into_key(&id), config);
                 }
             }
         }
@@ -458,6 +484,7 @@ impl Config {
         let providers_dir = &Self::providers_dir()?;
         let capabilities_dir = &Self::capabilities_dir()?;
         let launchers_dir = &Self::launchers_dir()?;
+        let recommended_configs_dir = &Self::recommended_configs_dir()?;
         alog_channel!(MessageLevel::Debug, "Models Dir: {:#?}", models_dir);
         alog_channel!(MessageLevel::Debug, "Providers Dir: {:#?}", providers_dir);
         alog_channel!(
@@ -466,12 +493,63 @@ impl Config {
             capabilities_dir
         );
         alog_channel!(MessageLevel::Debug, "Launchers Dir: {:#?}", launchers_dir);
+        alog_channel!(
+            MessageLevel::Debug,
+            "RecommendedConfigs Dir: {:#?}",
+            recommended_configs_dir
+        );
         config.models = Self::load_dir(models_dir, |s| s.to_string())?;
         config.providers = Self::load_dir(providers_dir, |s| s.to_string())?;
         config.capabilities = Self::load_dir(capabilities_dir, |s| s.to_string())?;
         config.launchers = Self::load_dir(launchers_dir, |s| s.to_string())?;
+        config.recommended_configs = Self::load_recommended_configs(recommended_configs_dir)?;
 
         Ok(config)
+    }
+
+    /// Loads the user recommended configs in `dir`. A `<launcher>.yaml` file
+    /// that `load_dir` skips, because it cannot be parsed or its `launcher`
+    /// field is not `<launcher>`, still produces an entry for `<launcher>`
+    /// with no capabilities. `effective_capabilities` then recommends nothing
+    /// for that launcher. Without the entry it would use the built-in config
+    /// that the file was written to replace.
+    fn load_recommended_configs(
+        dir: &Path,
+    ) -> Result<HashMap<String, recommended_config::RecommendedConfiguration>> {
+        let mut map: HashMap<String, recommended_config::RecommendedConfiguration> =
+            Self::load_dir(dir, |s| s.to_string())?;
+        if !dir.exists() {
+            return Ok(map);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "yaml") {
+                continue;
+            }
+            let file_name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let launcher = Self::id_from_filename(&file_name);
+            if map.contains_key(&launcher) {
+                continue;
+            }
+            alog_channel!(
+                MessageLevel::Warning,
+                "Recommended config {} was not loaded: setup recommends no capabilities \
+                 for launcher \"{}\" until the file is fixed or removed",
+                path.display(),
+                launcher
+            );
+            map.insert(
+                launcher.clone(),
+                recommended_config::RecommendedConfiguration {
+                    launcher,
+                    capabilities: Vec::new(),
+                },
+            );
+        }
+        Ok(map)
     }
 
     fn id_to_filename(id: &str) -> String {
@@ -760,6 +838,36 @@ mod tests {
     }
 
     #[test]
+    fn an_insert_that_cannot_be_saved_still_lands_in_memory() {
+        let _home = TestConfigHome::new();
+        // Point the home at a file, so writing any config file under it
+        // fails.
+        let home = std::env::var("GRANITE_CLI_HOME").unwrap();
+        let blocked = Path::new(&home).join("blocked");
+        fs::write(&blocked, "not a directory").unwrap();
+        // SAFETY: serialized by CONFIG_HOME_LOCK, held by `_home`.
+        unsafe { std::env::set_var("GRANITE_CLI_HOME", &blocked) };
+
+        let mut config = Config::default();
+        let result = config.insert_provider(
+            "p1",
+            ProviderConfig {
+                provider_id: "p1".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+
+        // The caller is told, and the entry is in memory regardless. Callers
+        // treat that error as a warning, which is how a setup step can report
+        // success over configuration that was never written, and why the
+        // helpers that configure something new check what is actually there
+        // afterwards.
+        assert!(result.is_err());
+        assert!(config.get_provider("p1").is_some());
+    }
+
+    #[test]
     fn insert_and_remove_launcher() {
         let _home = TestConfigHome::new();
 
@@ -775,5 +883,87 @@ mod tests {
 
         config.remove_launcher("claude").unwrap();
         assert!(config.get_launcher("claude").is_none());
+    }
+
+    #[test]
+    fn recommended_config_loads_from_directory() {
+        let _home = TestConfigHome::new();
+
+        // Drop a YAML file into the recommended_configs directory
+        let rc_dir =
+            Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("recommended_configs");
+        fs::create_dir_all(&rc_dir).unwrap();
+        fs::write(
+            rc_dir.join("claude.yaml"),
+            "launcher: claude\ncapabilities:\n  - capability: agent-model\n    models:\n      model_id:\n        min_context_length: ~\n        models:\n          - model: \"claude-sonnet-4-20250514\"\n            variant_precisions: []\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+        assert!(config.recommended_configs.contains_key("claude"));
+        let rc = config.recommended_configs.get("claude").unwrap();
+        assert_eq!(rc.launcher, "claude");
+        assert_eq!(rc.capabilities.len(), 1);
+        assert_eq!(rc.capabilities[0].capability, "agent-model");
+    }
+
+    #[test]
+    fn recommended_config_mismatched_id_recommends_nothing_for_its_file_name() {
+        let _home = TestConfigHome::new();
+
+        // Write a file whose launcher id does not match its filename
+        let rc_dir =
+            Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("recommended_configs");
+        fs::create_dir_all(&rc_dir).unwrap();
+        // Filename is "other.yaml" but the launcher field says "claude"
+        fs::write(
+            rc_dir.join("other.yaml"),
+            "launcher: claude\ncapabilities:\n  - capability: agent-model\n    models: {}\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+        // "claude" key should NOT be present because the filename was "other"
+        assert!(!config.recommended_configs.contains_key("claude"));
+        // "other" gets an entry with no capabilities, so the built-in or
+        // wildcard config is not used for it
+        let other = config
+            .recommended_configs
+            .get("other")
+            .expect("a file that is not loaded still produces an entry");
+        assert_eq!(other.launcher, "other");
+        assert!(other.capabilities.is_empty());
+    }
+
+    #[test]
+    fn recommended_config_with_an_unknown_field_recommends_nothing() {
+        let _home = TestConfigHome::new();
+
+        // `variant_precision` is a misspelling of `variant_precisions`.
+        // Accepting it would admit every precision of the model.
+        let rc_dir =
+            Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("recommended_configs");
+        fs::create_dir_all(&rc_dir).unwrap();
+        fs::write(
+            rc_dir.join("claude.yaml"),
+            "launcher: claude\ncapabilities:\n  - capability: sub-agent-explore\n    models:\n      model_id:\n        min_context_length: ~\n        models:\n          - model: granite-4.2-3b\n            variant_precision: [Q8_0]\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+        let claude = config
+            .recommended_configs
+            .get("claude")
+            .expect("a file that is not loaded still produces an entry");
+        assert!(claude.capabilities.is_empty());
+        // The built-in claude.yaml is not used in its place.
+        assert!(
+            recommended_config::effective_capabilities(
+                "claude",
+                &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+                &config.recommended_configs,
+            )
+            .is_empty()
+        );
     }
 }

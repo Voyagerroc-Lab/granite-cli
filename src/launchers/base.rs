@@ -245,6 +245,132 @@ pub(crate) async fn run_command(
     .await?
 }
 
+/// Resolve a command and run it, capturing stdout/stderr into returned strings.
+///
+/// Mirrors `run_command`'s structure but captures output instead of inheriting
+/// stdio. Used for machine-consumed subprocess calls (e.g. a headless `pi
+/// --print`) where the caller needs the subprocess's output as a string rather
+/// than watching it in a terminal.
+///
+/// Returns `(exit_status, stdout, stderr)`. A non-success exit status is
+/// returned as `Ok` -- the caller decides what a bad code means.
+pub(crate) async fn run_command_captured(
+    binary: PathBuf,
+    overlay: &[EnvBinding],
+    args: &[String],
+    ctx: &LaunchContext,
+) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    if ctx.dry_run {
+        // Return a dummy success status so callers don't need to special-case
+        // dry_run.  The exit status and captured strings are meaningless in this
+        // mode anyway.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            return Ok((
+                std::process::ExitStatus::from_raw(0),
+                String::new(),
+                String::new(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            return Ok((
+                std::process::ExitStatus::from_raw(0),
+                String::new(),
+                String::new(),
+            ));
+        }
+    }
+
+    // Translate WSL paths in env vars when spawning a native Windows binary.
+    let translated_overlay = translate_env_for_windows(&binary, overlay);
+
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    for binding in &translated_overlay {
+        cmd.env(&binding.key, &binding.value);
+    }
+
+    // Spawn and wait on a blocking thread: `Child::wait` blocks the calling
+    // thread until the subprocess exits, which would otherwise starve the
+    // async runtime -- notably the usage-tracking proxy server, which needs
+    // scheduler time concurrently with the child running.
+    //
+    // On Windows, some PE binaries (notably from official release builds run
+    // in WSL) fail with os error 193 ("%1 is not a valid Win32 application")
+    // when spawned directly. In those cases, fall back to invoking through
+    // `cmd.exe /C`, which handles PE format compatibility correctly.
+    #[cfg(windows)]
+    let (binary_fallback, args_fallback, overlay_fallback) =
+        (binary.clone(), args.to_vec(), translated_overlay);
+
+    tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+            let mut spawn_cmd = cmd;
+
+            // In WSL, the parent's CWD may be a WSL path that gets translated to
+            // a UNC path for Windows processes. If the binary is on a Windows
+            // drive, set the CWD to that drive's root to avoid the UNC issue.
+            #[cfg(windows)]
+            if let Some(drive) = binary_fallback.parent().and_then(|p| {
+                p.to_str().and_then(|s| {
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= 2 && chars[1] == ':' {
+                        Some(format!("{}\\", &s[..2]))
+                    } else {
+                        None
+                    }
+                })
+            }) {
+                spawn_cmd.current_dir(drive);
+            }
+
+            let output = match spawn_cmd.output() {
+                Ok(output) => output,
+                #[allow(unreachable_code)]
+                Err(e) => {
+                    #[cfg(windows)]
+                    if let Some(193) = e.raw_os_error() {
+                        let mut shell = std::process::Command::new("cmd.exe");
+                        shell.arg("/C");
+                        // Build the full command string for cmd.exe
+                        let mut cmd_str = String::new();
+                        cmd_str.push_str(&binary_fallback.to_string_lossy());
+                        for arg in &args_fallback {
+                            cmd_str.push(' ');
+                            cmd_str.push_str(arg);
+                        }
+                        shell.arg(&cmd_str);
+                        for binding in &overlay_fallback {
+                            shell.env(&binding.key, &binding.value);
+                        }
+                        return shell
+                            .output()
+                            .map(|o| {
+                                (
+                                    o.status,
+                                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                                )
+                            })
+                            .map_err(anyhow::Error::from);
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            Ok((
+                output.status,
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        },
+    )
+    .await?
+}
+
 /// Metadata describing a launcher implementation (type-level, catalog entry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherMetadata {
@@ -513,15 +639,15 @@ pub(crate) mod tests {
             base_env: HashMap::new(),
             dry_run: false,
         };
-        let status = run_command(
-            PathBuf::from("/bin/echo"),
-            &[],
-            &["hello".to_string()],
-            &ctx,
-            &ui,
-        )
-        .await
-        .unwrap();
+        #[cfg(unix)]
+        let (binary, args) = (PathBuf::from("/bin/echo"), vec!["hello".to_string()]);
+        #[cfg(windows)]
+        let (binary, args) = (
+            PathBuf::from("cmd"),
+            vec!["/C".to_string(), "echo".to_string(), "hello".to_string()],
+        );
+
+        let status = run_command(binary, &[], &args, &ctx, &ui).await.unwrap();
         assert!(status.success());
     }
 }

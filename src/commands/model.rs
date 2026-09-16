@@ -3,6 +3,7 @@ use anyhow::Result;
 
 // Local
 use crate::commands::ProviderCommands;
+use crate::config::validation::RefKind;
 use crate::dependency::{self, Configured, DependsOn, Requirement};
 use crate::models::{
     ContextFit, MODEL_REGISTRY, ModelMetadata, ModelSource, ModelType, ModelVariant,
@@ -11,7 +12,7 @@ use crate::providers::{
     PROVIDER_REGISTRY, Provider, ProviderMetadata, ProviderSource, ProviderType, PullResult,
 };
 use crate::utils::Searchable;
-use crate::utils::hardware::detect_hardware;
+use crate::utils::hardware::{HardwareProfile, detect_hardware};
 use crate::utils::prompt_from_schema;
 use crate::utils::ui::Ui;
 
@@ -168,8 +169,8 @@ impl ModelCommands {
         display_providers: &[(String, &dyn Provider)],
         wide: bool,
         ui: &dyn crate::utils::ui::base::Ui,
+        profile: &HardwareProfile,
     ) -> Vec<Vec<String>> {
-        let profile = detect_hardware();
         let models = MODEL_REGISTRY.entries();
 
         let mut rows: Vec<(f64, Vec<String>)> = models
@@ -190,7 +191,7 @@ impl ModelCommands {
                             &m.architecture,
                             &m.native_dtype,
                             v,
-                            &profile,
+                            profile,
                         );
                         (fit, v)
                     })
@@ -327,6 +328,7 @@ impl ModelCommands {
             &instances,
             wide,
             ctx.ui.as_ref(),
+            &detect_hardware(),
         );
         if table_rows.is_empty() {
             let msg = if matches!(&providers, Some(list) if list.is_empty()) {
@@ -407,6 +409,7 @@ impl ModelCommands {
     }
 
     pub fn list(ctx: &crate::AppContext, filter_type: Option<ModelType>) -> Result<()> {
+        let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Model);
         let source = ModelSource::from_config(&ctx.config);
         let mut enriched: Vec<(Vec<String>, ModelMetadata)> = Vec::new();
 
@@ -420,8 +423,9 @@ impl ModelCommands {
             let provider_id = ctx
                 .config
                 .get_model(&instance_id)
-                .and_then(|c| c.provider_id.clone())
-                .unwrap_or_else(|| "None".to_string());
+                .unwrap()
+                .provider_id
+                .clone();
             let row = vec![
                 instance_id.clone(),
                 md.family.clone(),
@@ -434,11 +438,39 @@ impl ModelCommands {
         }
         sort_enriched_rows(&mut enriched);
 
-        let rows: Vec<Vec<String>> = enriched.into_iter().map(|(row, _)| row).collect();
+        let mut rows: Vec<Vec<String>> = enriched
+            .into_iter()
+            .map(|(mut row, _)| {
+                row.push(notes.get(&row[0]).cloned().unwrap_or_default());
+                row
+            })
+            .collect();
+
+        // A model whose type is not in the registry cannot be constructed,
+        // so it never reaches `instances()` and would drop out of the list
+        // at exactly the moment something is wrong with it. Give it a row
+        // carrying the reason instead. A filtered list leaves them out,
+        // since there is no metadata to filter them on.
+        if filter_type.is_none() {
+            let mut unconstructed: Vec<Vec<String>> = notes
+                .iter()
+                .filter(|(id, _)| !rows.iter().any(|row| &&row[0] == id))
+                .map(|(id, note)| {
+                    let mut row = vec![id.clone()];
+                    row.resize(6, "-".to_string());
+                    row.push(note.clone());
+                    row
+                })
+                .collect();
+            unconstructed.sort_by(|a, b| a[0].cmp(&b[0]));
+            rows.extend(unconstructed);
+        }
 
         ctx.ui.table(
             &format!("Configured Models ({} models)", rows.len()),
-            &["ID", "FAMILY", "SIZE", "CONTEXT", "TYPE", "PROVIDER"],
+            &[
+                "ID", "FAMILY", "SIZE", "CONTEXT", "TYPE", "PROVIDER", "NOTES",
+            ],
             &rows,
         );
         Ok(())
@@ -494,7 +526,26 @@ impl ModelCommands {
             .map(|m| Self::metadata_fields(&m))
     }
 
-    pub fn info(ctx: &crate::AppContext, id: &str) -> Result<()> {
+    pub async fn info(ctx: &mut crate::AppContext, id: &str) -> Result<()> {
+        // Only a configured instance can have a broken reference. An id that
+        // names a catalog type is being browsed, not diagnosed.
+        if ctx.config.get_model(id).is_some() {
+            crate::commands::shared::remediation::remediate(
+                ctx,
+                RefKind::Model,
+                id,
+                crate::commands::shared::remediation::OnDecline::Skip,
+                true,
+            )
+            .await?;
+
+            // Removing it is one of the choices offered above, and leaves
+            // nothing to show.
+            if ctx.config.get_model(id).is_none() {
+                return Ok(());
+            }
+        }
+
         // Prefer a configured instance's real, live values (e.g. a custom
         // model's user-entered fields aren't in the registry at all) --
         // fall back to pure catalog browsing by registry key.
@@ -502,31 +553,39 @@ impl ModelCommands {
             let source = ModelSource::from_config(&ctx.config);
             if let Some((_, model)) = source.instances().into_iter().find(|(iid, _)| iid == id) {
                 let md = model.to_metadata();
-                let mut fields = Self::metadata_fields(&md);
-                fields.push(("Config: Type", model_config.model_type.clone()));
-                fields.push((
+                let type_fields = Self::metadata_fields(&md);
+
+                ctx.ui.detail("Type Metadata", &type_fields);
+
+                let mut instance_fields: Vec<(&str, String)> = Vec::new();
+                instance_fields.push(("Config: Type", model_config.model_type.clone()));
+                instance_fields.push((
                     "Config: Provider",
                     format!("{:?}", model_config.provider_id),
                 ));
-                fields.push(("Config: Variant", format!("{:?}", model_config.variant)));
-                ctx.ui.detail(id, &fields);
+                instance_fields.push(("Config: Variant", format!("{:?}", model_config.variant)));
+                ctx.ui.detail(id, &instance_fields);
                 return Ok(());
             }
         }
 
         match Self::info_fields(id) {
-            Some(mut fields) => {
+            Some(type_fields) => {
+                ctx.ui.detail("Type Metadata", &type_fields);
+
                 if let Some(configured) = ctx.config.get_model(id) {
-                    fields.push(("Config: Provider", format!("{:?}", configured.provider_id)));
-                    fields.push(("Config: Variant", format!("{:?}", configured.variant)));
+                    let mut instance_fields: Vec<(&str, String)> = Vec::new();
+                    instance_fields
+                        .push(("Config: Provider", format!("{:?}", configured.provider_id)));
+                    instance_fields.push(("Config: Variant", format!("{:?}", configured.variant)));
+
+                    ctx.ui.detail(id, &instance_fields);
                 }
 
-                ctx.ui.detail(id, &fields);
                 Ok(())
             }
             None => {
-                ctx.ui
-                    .error(&format!("Model '{id}' not found in registry."));
+                ctx.ui.info(&format!("Model '{id}' not found in registry."));
                 let available: Vec<_> = MODEL_REGISTRY
                     .entries()
                     .keys()
@@ -643,16 +702,17 @@ impl ModelCommands {
         };
 
         let provider_source = ProviderSource::from_config(&ctx.config);
+        let current_provider = existing_config.as_ref().map(|c| c.provider_id.clone());
         let provider_id = if let Some(variant) = &selected_variant {
             let requirement = VariantRequirement {
                 format: variant.format.clone(),
                 precision: variant.precision.clone(),
             };
             let resolution = dependency::resolve(&requirement, &provider_source);
-            Self::select_provider(ctx, &resolution).await?
+            Self::select_provider(ctx, &resolution, current_provider.as_deref()).await?
         } else {
             let resolution = dependency::resolve(&AnyProviderRequirement, &provider_source);
-            Self::select_provider(ctx, &resolution).await?
+            Self::select_provider(ctx, &resolution, current_provider.as_deref()).await?
         };
 
         let model_config = crate::config::ModelConfig {
@@ -672,7 +732,7 @@ impl ModelCommands {
         ctx.ui
             .info(&format!("\nModel '{instance_id}' configured successfully!"));
 
-        if let (Some(pid), Some(variant)) = (&provider_id, &selected_variant) {
+        if let (pid, Some(variant)) = (&provider_id, &selected_variant) {
             let is_local = ctx
                 .config
                 .get_provider(pid)
@@ -735,9 +795,7 @@ impl ModelCommands {
         }
 
         let (variant_str, provider_id) = match configured {
-            Some(c) if c.variant.is_some() && c.provider_id.is_some() => {
-                (c.variant.clone().unwrap(), c.provider_id.clone().unwrap())
-            }
+            Some(c) if c.variant.is_some() => (c.variant.clone().unwrap(), c.provider_id.clone()),
             _ => {
                 anyhow::bail!(
                     "Model '{model_id}' is not configured yet. Run `model setup {model_id}` first."
@@ -808,6 +866,18 @@ impl ModelCommands {
             anyhow::bail!("No model configured with id '{model_id}'. Nothing to remove.");
         }
 
+        // Anything pointing at it would be stranded by this removal.
+        match crate::commands::shared::remediation::confirm_removal(ctx, RefKind::Model, model_id)?
+        {
+            crate::commands::shared::remediation::Removal::Cancel => {
+                ctx.ui.info(&format!("Keeping model '{model_id}'."));
+                return Ok(());
+            }
+            crate::commands::shared::remediation::Removal::Proceed { with } => {
+                crate::commands::shared::remediation::remove_all(ctx, &with)?;
+            }
+        }
+
         if let Err(e) = ctx.config.remove_model(model_id) {
             ctx.ui
                 .warn(&format!("failed to persist model removal: {e}"));
@@ -822,7 +892,8 @@ impl ModelCommands {
     async fn select_provider(
         ctx: &mut crate::AppContext,
         resolution: &dependency::Resolution,
-    ) -> Result<Option<String>> {
+        current: Option<&str>,
+    ) -> Result<String> {
         if resolution.is_unsatisfiable() {
             anyhow::bail!(
                 "No provider type supports this model's format/precision; configure a compatible provider first, then set up this model."
@@ -838,12 +909,17 @@ impl ModelCommands {
         let choice = if options.len() == 1 {
             0
         } else {
-            ctx.ui
-                .select("Select a provider for this model", &options, 0)?
+            let prompt = crate::commands::shared::remediation::prompt_with_current(
+                ctx,
+                "Select a provider for this model",
+                RefKind::Provider,
+                current,
+            );
+            ctx.ui.select(&prompt, &options, 0)?
         };
 
         if options[choice] != CONFIGURE_NEW {
-            return Ok(Some(options[choice].clone()));
+            return Ok(options[choice].clone());
         }
 
         let provider_type = if resolution.configurable_types.len() == 1 {
@@ -864,13 +940,28 @@ impl ModelCommands {
 
         ProviderCommands::setup(ctx, provider_type, Some(&nickname)).await?;
 
-        Ok(Some(nickname))
+        // Setup reports success even when it configured nothing: a name that
+        // collides with an existing provider, and an overwrite the user then
+        // declines, both land here. Check what is configured under that id
+        // rather than trusting the id we asked for.
+        match ctx.config.get_provider(&nickname) {
+            Some(provider) if provider.provider_type == provider_type => Ok(nickname),
+            Some(provider) => anyhow::bail!(
+                "Provider '{nickname}' is already configured as '{}', which is not what \
+                 this model needs. Re-run setup and give the new provider a different name.",
+                provider.provider_type
+            ),
+            None => anyhow::bail!(
+                "Provider '{nickname}' was not configured, so this model would have \
+                 nothing to run on. Re-run setup once the provider is in place."
+            ),
+        }
     }
 }
 
 /// Trigger `provider`'s native download/pull mechanism for `variant`,
 /// reporting progress through `ui`. Separated from `ModelCommands::pull` so
-/// a future `launch` pre-flight step can call it directly without going
+/// a future `launch` pre-launch step can call it directly without going
 /// through config lookup or CLI-specific error messages.
 pub async fn ensure_model_pulled(
     provider: &dyn Provider,
@@ -896,6 +987,21 @@ mod tests {
         crate::AppContext {
             config: Config::default(),
             ui: Arc::new(CaptureUi::default()),
+        }
+    }
+
+    /// A canned hardware profile with generous RAM and no GPU, used so
+    /// `recommend_rows` tests exercise the fit logic deterministically
+    /// instead of depending on whatever hardware (and, on some CI runners,
+    /// misdetected GPU) actually runs the test.
+    fn generous_hardware_profile() -> HardwareProfile {
+        HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 512.0,
         }
     }
 
@@ -946,7 +1052,7 @@ mod tests {
             ModelConfig {
                 model_id: id.to_string(),
                 model_type: id.to_string(),
-                provider_id: provider_id.map(String::from),
+                provider_id: provider_id.unwrap_or("ollama").to_string(),
                 variant: None,
                 config: serde_json::json!({}),
             },
@@ -967,7 +1073,7 @@ mod tests {
             ModelConfig {
                 model_id: model_id.to_string(),
                 model_type: model_id.to_string(),
-                provider_id: Some(provider_id.to_string()),
+                provider_id: provider_id.to_string(),
                 variant: Some(variant.to_string()),
                 config: serde_json::json!({}),
             },
@@ -1137,45 +1243,43 @@ mod tests {
     }
 
     #[test]
-    fn list_configured_model_without_provider_shows_none() {
-        let ctx = ctx_with_model("granite-3.1-8b-instruct", None);
-        ModelCommands::list(&ctx, None).unwrap();
-        let tables = tables!(ctx);
-        let (_, _, rows) = &tables[0];
-        assert!(rows[0].iter().any(|c| c == "None"));
-    }
-
-    #[test]
-    fn list_unknown_model_id_in_config_is_skipped() {
+    fn list_shows_a_model_whose_type_is_unknown_with_the_reason() {
         let ctx = ctx_with_model("this-model-does-not-exist", Some("p1"));
         ModelCommands::list(&ctx, None).unwrap();
         let tables = tables!(ctx);
-        let (_, _, rows) = &tables[0];
-        // The unknown id is not in MODEL_REGISTRY, so it should be skipped
-        assert_eq!(rows.len(), 0);
+        let (_, headers, rows) = &tables[0];
+        // The type is not in MODEL_REGISTRY, so the model cannot be
+        // constructed and has no metadata to fill the other columns. It still
+        // gets a row: dropping it would hide a configured model at exactly
+        // the moment something is wrong with it.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "this-model-does-not-exist");
+        let notes = headers.iter().position(|h| h == "NOTES").unwrap();
+        assert!(rows[0][notes].contains("unknown model type"), "{rows:?}");
     }
 
     // -- info -----------------------------------------------------------------
 
-    #[test]
-    fn info_known_model_renders_detail_with_key_fields() {
-        let ctx = empty_ctx();
-        ModelCommands::info(&ctx, "granite-3.1-8b-instruct").unwrap();
+    #[tokio::test]
+    async fn info_known_model_renders_detail_with_key_fields() {
+        let mut ctx = empty_ctx();
+        ModelCommands::info(&mut ctx, "granite-3.1-8b-instruct")
+            .await
+            .unwrap();
         let details = details!(ctx);
         assert_eq!(details.len(), 1);
         let (title, fields) = &details[0];
-        assert_eq!(title, "granite-3.1-8b-instruct");
+        assert_eq!(title, "Type Metadata");
         assert!(fields.iter().any(|(k, _)| k == "Family"));
         assert!(fields.iter().any(|(k, _)| k == "Context Length"));
         assert!(fields.iter().any(|(k, _)| k == "Supported Functions"));
     }
 
-    #[test]
-    fn info_unknown_model_returns_err_and_emits_error() {
-        let ctx = empty_ctx();
-        let result = ModelCommands::info(&ctx, "does-not-exist");
+    #[tokio::test]
+    async fn info_unknown_model_returns_err_and_emits_error() {
+        let mut ctx = empty_ctx();
+        let result = ModelCommands::info(&mut ctx, "does-not-exist").await;
         assert!(result.is_err());
-        assert!(!errors!(ctx).is_empty());
     }
 
     fn metadata_supporting(formats: Vec<ModelFormat>) -> ProviderMetadata {
@@ -1409,9 +1513,19 @@ mod tests {
             "openai-compatible",
             serde_json::json!({ "base_url": "http://localhost:8080" }),
         ));
-        ModelCommands::recommend(&ctx, None, &[], false).unwrap();
+        let source = ProviderSource::from_config(&ctx.config);
+        let instances = source.instances();
+        let providers: Vec<&dyn Provider> = instances.iter().map(|(_, p)| *p).collect();
+        let rows = ModelCommands::recommend_rows(
+            None,
+            Some(&providers),
+            &instances,
+            false,
+            ctx.ui.as_ref(),
+            &generous_hardware_profile(),
+        );
         assert!(
-            !tables!(ctx).is_empty(),
+            !rows.is_empty(),
             "a permissive configured provider should surface recommendations"
         );
     }
@@ -1517,7 +1631,14 @@ mod tests {
     #[test]
     fn recommend_providers_column_is_none_with_no_display_providers() {
         let ui = Box::new(CaptureUi::default());
-        let rows = ModelCommands::recommend_rows(None, None, &[], false, &*ui);
+        let rows = ModelCommands::recommend_rows(
+            None,
+            None,
+            &[],
+            false,
+            &*ui,
+            &generous_hardware_profile(),
+        );
         for row in &rows {
             assert_eq!(
                 row[5], "None",
@@ -1660,7 +1781,7 @@ mod tests {
             ModelConfig {
                 model_id: instance_id.to_string(),
                 model_type: "custom".to_string(),
-                provider_id: provider_id.map(String::from),
+                provider_id: provider_id.unwrap_or("ollama").to_string(),
                 variant: None,
                 config: config_value,
             },
@@ -1690,9 +1811,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn info_shows_a_custom_models_real_values_and_config_type() {
-        let ctx = ctx_with_custom_model(
+    #[tokio::test]
+    async fn info_shows_a_custom_models_real_values_and_config_type() {
+        let mut ctx = ctx_with_custom_model(
             "my-custom",
             serde_json::json!({
                 "family": "My Local Model",
@@ -1700,18 +1821,21 @@ mod tests {
             }),
             None,
         );
-        ModelCommands::info(&ctx, "my-custom").unwrap();
+        ModelCommands::info(&mut ctx, "my-custom").await.unwrap();
         let details = details!(ctx);
-        assert_eq!(details.len(), 1);
-        let (title, fields) = &details[0];
-        assert_eq!(title, "my-custom");
+        assert_eq!(details.len(), 2);
+        let (title1, fields1) = &details[0];
+        assert_eq!(title1, "Type Metadata");
         assert!(
-            fields
+            fields1
                 .iter()
                 .any(|(k, v)| k == "Family" && v == "My Local Model")
         );
+
+        let (title2, fields2) = &details[1];
+        assert_eq!(title2, "my-custom");
         assert!(
-            fields
+            fields2
                 .iter()
                 .any(|(k, v)| k == "Config: Type" && v == "custom")
         );
@@ -1729,7 +1853,7 @@ mod tests {
             ModelConfig {
                 model_id: "my-custom".to_string(),
                 model_type: "custom".to_string(),
-                provider_id: Some("openai".to_string()),
+                provider_id: "openai".to_string(),
                 variant: Some("safetensors/bfloat16".to_string()),
                 config: serde_json::json!({
                     "family": "My Local Model",
@@ -1775,8 +1899,7 @@ mod tests {
             .expect("custom model should be saved under its instance id");
         assert_eq!(configured.model_type, "custom");
         assert_eq!(
-            configured.provider_id,
-            Some("my-openai".to_string()),
+            configured.provider_id, "my-openai",
             "with no variants to filter by, the sole existing provider should be selected"
         );
         assert!(
@@ -1796,6 +1919,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_provider_rejects_a_name_colliding_with_a_provider_it_did_not_overwrite() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = empty_ctx();
+        ctx.config.providers.insert(
+            "shared".to_string(),
+            crate::config::ProviderConfig {
+                provider_id: "shared".to_string(),
+                provider_type: "openai-compatible".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        // Configuring a new one is the only choice, and the name typed for it
+        // collides. The overwrite confirmation inside provider setup defaults
+        // to no, so nothing is written.
+        let ui = (&*ctx.ui as &dyn std::any::Any)
+            .downcast_ref::<CaptureUi>()
+            .unwrap();
+        ui.text_answers.borrow_mut().push_back("shared".to_string());
+
+        let resolution = dependency::Resolution {
+            existing_instances: vec![],
+            configurable_types: vec!["ollama"],
+        };
+        let err = ModelCommands::select_provider(&mut ctx, &resolution, None)
+            .await
+            .unwrap_err();
+
+        // Silently handing back the provider that was already there would
+        // attach this model to something that cannot run it.
+        assert!(err.to_string().contains("already configured as"), "{err}");
+        assert_eq!(
+            ctx.config.get_provider("shared").unwrap().provider_type,
+            "openai-compatible"
+        );
+    }
+
+    #[tokio::test]
     async fn select_provider_bails_when_no_provider_type_can_ever_satisfy_the_requirement() {
         let mut ctx = empty_ctx();
         let resolution = dependency::Resolution {
@@ -1803,7 +1963,7 @@ mod tests {
             configurable_types: vec![],
         };
 
-        let err = ModelCommands::select_provider(&mut ctx, &resolution)
+        let err = ModelCommands::select_provider(&mut ctx, &resolution, None)
             .await
             .unwrap_err();
         assert!(

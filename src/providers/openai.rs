@@ -34,6 +34,13 @@ pub struct OpenAIProviderConfig {
     /// Specific function-to-endpoint mappings this instance supports.
     /// If None, will use default OpenAI mappings.
     pub function_endpoints: Option<HashMap<ModelFunction, Vec<ApiEndpoint>>>,
+
+    /// Custom HTTP headers to be sent with each API request.
+    /// Keys are header names (strings) and values are secret tokens.
+    pub custom_headers: Option<HashMap<String, Secret>>,
+
+    /// Per-model alias mapping.
+    pub model_aliases: Option<HashMap<String, String>>,
 }
 
 fn default_timeout() -> u64 {
@@ -57,6 +64,8 @@ impl Default for OpenAIProviderConfig {
             verify_ssl: true,
             health_check_endpoint: "/v1/models".to_string(),
             function_endpoints: None,
+            custom_headers: None,
+            model_aliases: None,
         }
     }
 }
@@ -68,6 +77,8 @@ pub struct OpenAIProvider {
     config: OpenAIProviderConfig,
     client: reqwest::Client,
     function_endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
+    custom_headers: HashMap<String, Secret>,
+    model_aliases: HashMap<String, String>,
 }
 
 impl OpenAIProvider {
@@ -112,13 +123,20 @@ impl ConfigConstructable for OpenAIProvider {
         let function_endpoints = config
             .function_endpoints
             .clone()
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(Self::default_function_endpoints);
+
+        let custom_headers = config.custom_headers.clone().unwrap_or_default();
+
+        let model_aliases = config.model_aliases.clone().unwrap_or_default();
 
         Self {
             instance_id: instance_id.to_string(),
             config,
             client,
             function_endpoints,
+            custom_headers,
+            model_aliases,
         }
     }
 }
@@ -155,12 +173,24 @@ impl Provider for OpenAIProvider {
         self.config.verify_ssl
     }
 
+    fn custom_headers(&self) -> Option<HashMap<String, Secret>> {
+        Some(self.custom_headers.clone())
+    }
+
     fn supported_formats(&self) -> Vec<ModelFormat> {
         vec![ModelFormat::Safetensors, ModelFormat::GGUF]
     }
 
     fn can_run_model(&self, _variant_format: &str, _variant_precision: &str) -> bool {
         true
+    }
+
+    fn model_alias(
+        &self,
+        model_id: String,
+        _variant: Option<&crate::models::ModelVariant>,
+    ) -> Option<String> {
+        self.model_aliases.get(&model_id).cloned()
     }
 
     async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
@@ -175,6 +205,12 @@ impl Provider for OpenAIProvider {
 
         if let Some(ref api_key) = self.config.api_key {
             request = request.bearer_auth(&api_key.0);
+        }
+
+        if let Some(custom_headers) = &self.config.custom_headers {
+            for (key, value) in custom_headers {
+                request = request.header(key.clone(), &value.0);
+            }
         }
 
         match request.send().await {
@@ -237,24 +273,13 @@ impl Provider for OpenAIProvider {
 
 impl HasProviderMetadata for OpenAIProvider {
     fn metadata() -> ProviderMetadata {
-        let mut default_mappings = HashMap::new();
-        default_mappings.insert(ModelFunction::Chat, vec![ApiEndpoint::OpenAIChat]);
-        default_mappings.insert(
-            ModelFunction::Embeddings,
-            vec![ApiEndpoint::OpenAIEmbeddings],
-        );
-        default_mappings.insert(
-            ModelFunction::Transcription,
-            vec![ApiEndpoint::OpenAIAudioTranscription],
-        );
-
         ProviderMetadata {
             name: "OpenAI Compatible Provider".to_string(),
             description: "Provider for OpenAI-compatible API endpoints supporting chat, embeddings, and audio transcription".to_string(),
-            provider_type: ProviderType::Local,
+            provider_type: ProviderType::Hosted,
             default_endpoint: "http://localhost:8080".to_string(),
             supported_api_types: vec![ApiType::OpenAI],
-            default_function_endpoints: default_mappings,
+            default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![
                 ModelFormat::Safetensors,
                 ModelFormat::GGUF,
@@ -355,6 +380,40 @@ mod tests {
             Some(Secret("test-key".to_string()))
         );
         assert_eq!(provider.config.timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_custom_headers_are_applied_to_requests() {
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert(
+            "X-Custom-Header".to_string(),
+            Secret("custom-value".to_string()),
+        );
+        custom_headers.insert(
+            "X-Another-Header".to_string(),
+            Secret("another-value".to_string()),
+        );
+
+        let cfg = serde_json::json!({
+            "base_url": "http://example.com:8080",
+            "custom_headers": {
+                "X-Custom-Header": "custom-value",
+                "X-Another-Header": "another-value"
+            }
+        });
+
+        let provider = OpenAIProvider::new("my-openai", &cfg, &crate::config::Config::default());
+        assert!(provider.config.custom_headers.is_some());
+        let headers = provider.config.custom_headers.as_ref().unwrap();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(
+            headers.get("X-Custom-Header").map(|s| s.0.as_str()),
+            Some("custom-value")
+        );
+        assert_eq!(
+            headers.get("X-Another-Header").map(|s| s.0.as_str()),
+            Some("another-value")
+        );
     }
 
     #[test]

@@ -96,6 +96,8 @@ pub struct AgentModelBinding {
     pub api_key: Option<Secret>,
     pub verify_ssl: bool,
     pub context_length: Option<u64>,
+    /// Custom headers to be sent with each request to the provider.
+    pub custom_headers: Option<HashMap<String, Secret>>,
 }
 
 /// Request payload for `BindingType::SubAgent` -- which `ApiType` the
@@ -198,14 +200,20 @@ pub enum McpBinding {
         command: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        /// Optional request timeout in milliseconds.
+        timeout: Option<u64>,
     },
     Http {
         url: String,
         headers: HashMap<String, String>,
+        /// Optional request timeout in milliseconds.
+        timeout: Option<u64>,
     },
     Sse {
         url: String,
         headers: HashMap<String, String>,
+        /// Optional request timeout in milliseconds.
+        timeout: Option<u64>,
     },
 }
 
@@ -233,24 +241,48 @@ impl McpBinding {
     /// modelcontextprotocol/modelcontextprotocol#292): `{"type":
     /// "stdio"|"http"|"sse", ...}`.
     pub fn to_canonical_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
         match self {
-            McpBinding::Stdio { command, args, env } => serde_json::json!({
-                "type": "stdio",
-                "command": command,
-                "args": args,
-                "env": env,
-            }),
-            McpBinding::Http { url, headers } => serde_json::json!({
-                "type": "http",
-                "url": url,
-                "headers": headers,
-            }),
-            McpBinding::Sse { url, headers } => serde_json::json!({
-                "type": "sse",
-                "url": url,
-                "headers": headers,
-            }),
+            McpBinding::Stdio {
+                command,
+                args,
+                env,
+                timeout,
+            } => {
+                map.insert("type".into(), serde_json::json!("stdio"));
+                map.insert("command".into(), serde_json::json!(command));
+                map.insert("args".into(), serde_json::json!(args));
+                map.insert("env".into(), serde_json::json!(env));
+                if let Some(t) = timeout {
+                    map.insert("timeout".into(), serde_json::json!(t));
+                }
+            }
+            McpBinding::Http {
+                url,
+                headers,
+                timeout,
+            } => {
+                map.insert("type".into(), serde_json::json!("http"));
+                map.insert("url".into(), serde_json::json!(url));
+                map.insert("headers".into(), serde_json::json!(headers));
+                if let Some(t) = timeout {
+                    map.insert("timeout".into(), serde_json::json!(t));
+                }
+            }
+            McpBinding::Sse {
+                url,
+                headers,
+                timeout,
+            } => {
+                map.insert("type".into(), serde_json::json!("sse"));
+                map.insert("url".into(), serde_json::json!(url));
+                map.insert("headers".into(), serde_json::json!(headers));
+                if let Some(t) = timeout {
+                    map.insert("timeout".into(), serde_json::json!(t));
+                }
+            }
         }
+        serde_json::Value::Object(map)
     }
 }
 
@@ -262,7 +294,6 @@ impl McpBinding {
 pub trait Capability: crate::registry::Named + Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn dependencies(&self) -> Vec<Dependency>;
 
     /// Which binding surfaces this capability instance can fill.
     fn binding_types(&self) -> HashSet<BindingType>;
@@ -312,9 +343,10 @@ impl std::fmt::Display for CapabilityMetadata {
 /*-- Supporting Types --------------------------------------------------------*/
 
 /// A capability's declared dependency on a model, provider, or external shell
-/// command. `resolved_id` is `None` at the type level (catalog display,
-/// before any instance is configured) and `Some(id)` once a concrete
-/// instance has picked a specific dependency.
+/// command, as declared by `CapabilityMetadata` for a capability type.
+/// `config_key` names the key in a configured instance's own config JSON that
+/// holds the resolved id, which is how `config::validation` reads it without
+/// constructing anything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Dependency {
     Model {
@@ -398,6 +430,7 @@ mod mcp_binding_tests {
             command: "/usr/local/bin/granite-cli".to_string(),
             args: vec!["__mcp-serve".to_string(), "vision".to_string()],
             env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            timeout: None,
         }
     }
 
@@ -405,6 +438,7 @@ mod mcp_binding_tests {
         McpBinding::Http {
             url: "http://127.0.0.1:54321/mcp".to_string(),
             headers: HashMap::from([("X-Test".to_string(), "1".to_string())]),
+            timeout: None,
         }
     }
 
@@ -431,8 +465,32 @@ mod mcp_binding_tests {
         let json = McpBinding::Sse {
             url: "http://127.0.0.1:1/sse".to_string(),
             headers: HashMap::new(),
+            timeout: None,
         }
         .to_canonical_json();
         assert_eq!(json["type"], "sse");
+    }
+
+    #[test]
+    fn canonical_json_includes_timeout_when_set() {
+        let json = McpBinding::Http {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            headers: HashMap::new(),
+            timeout: Some(300_000),
+        }
+        .to_canonical_json();
+        assert_eq!(json["timeout"], 300_000u64);
+    }
+
+    #[test]
+    fn canonical_json_omits_timeout_when_none() {
+        let json = McpBinding::Stdio {
+            command: "my-command".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            timeout: None,
+        }
+        .to_canonical_json();
+        assert!(!json.as_object().unwrap().contains_key("timeout"));
     }
 }

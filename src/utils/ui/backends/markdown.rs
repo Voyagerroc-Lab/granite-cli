@@ -20,6 +20,11 @@ impl ConfigConstructable for MarkdownOutput {
 }
 
 impl Ui for MarkdownOutput {
+    /// Output meant for a program to read, with nobody to prompt.
+    fn is_interactive(&self) -> bool {
+        false
+    }
+
     fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
         println!("\n## {title}\n");
         let header_line = format!("| {} |", headers.join(" | "));
@@ -60,10 +65,10 @@ impl Ui for MarkdownOutput {
         println!("{msg}");
     }
     fn warn(&self, msg: &str) {
-        println!("Warning: {msg}");
+        println!("> [!warning]\n> {msg}");
     }
     fn error(&self, msg: &str) {
-        eprintln!("Error: {msg}");
+        eprintln!("> [!critical]\n> {msg}");
     }
 
     fn select(&self, _prompt: &str, _items: &[String], _default: usize) -> anyhow::Result<usize> {
@@ -136,6 +141,16 @@ mod tests {
         &serde_json::json!({}),
         &crate::config::Config::default()
     ));
+
+    #[test]
+    fn markdown_output_is_not_interactive() {
+        let out = MarkdownOutput::new(
+            "markdown",
+            &serde_json::json!({}),
+            &crate::config::Config::default(),
+        );
+        assert!(!out.is_interactive());
+    }
 
     #[test]
     fn markdown_table_contains_pipe_chars() {

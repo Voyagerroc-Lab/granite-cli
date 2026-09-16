@@ -165,7 +165,7 @@ impl Launcher for ClaudeLauncher {
             if api_key_val.is_empty() {
                 api_key_val = "unset".to_string(); // Claude treats empty strings like unset
             }
-            let bindings = vec![
+            let mut bindings = vec![
                 EnvBinding {
                     key: "ANTHROPIC_BASE_URL".to_string(),
                     value: binding.base_url.clone(),
@@ -185,6 +185,37 @@ impl Launcher for ClaudeLauncher {
                     value: api_key_val,
                 },
             ];
+
+            // Add custom headers if configured, formatted as "Name: Value" pairs
+            // newline-separated, matching ANTHROPIC_CUSTOM_HEADERS format.
+            // Sort by key for deterministic output.
+            if let Some(ref headers) = binding.custom_headers {
+                if !headers.is_empty() {
+                    let mut header_pairs: Vec<(String, String)> = headers
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                serde_json::to_value(v)
+                                    .unwrap()
+                                    .as_str()
+                                    .unwrap()
+                                    .to_string(),
+                            )
+                        })
+                        .collect();
+                    header_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    let header_lines: Vec<String> = header_pairs
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {v}"))
+                        .collect();
+                    bindings.push(EnvBinding {
+                        key: "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+                        value: header_lines.join("\n"),
+                    });
+                }
+            }
+
             // verify_ssl is dropped per user's note
             Ok(bindings)
         } else {
@@ -415,6 +446,7 @@ impl HasClaudeLauncherMetadata for ClaudeLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn command_defaults_to_claude() {
@@ -485,6 +517,85 @@ mod tests {
     fn metadata_supports_sub_agent_binding() {
         let meta = ClaudeLauncher::metadata();
         assert!(meta.supported_capabilities.contains(&BindingType::SubAgent));
+    }
+
+    #[tokio::test]
+    async fn env_overlay_includes_custom_headers() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "X-Custom-Header".to_string(),
+            crate::registry::Secret::from("value1"),
+        );
+        headers.insert(
+            "User-Agent".to_string(),
+            crate::registry::Secret::from("my-agent/1.0"),
+        );
+        let l = launcher_with(
+            Some(crate::capabilities::AgentModelBinding {
+                api_type: crate::providers::ApiType::Anthropic,
+                provider_name: "test".to_string(),
+                base_url: "http://test".to_string(),
+                model_name: "test-model".to_string(),
+                endpoint_path: "/v1/messages".to_string(),
+                api_key: Some(crate::registry::Secret::from("test-key")),
+                verify_ssl: true,
+                context_length: Some(4096),
+                custom_headers: Some(headers),
+            }),
+            vec![],
+        );
+        let overlay = l.env_overlay(&test_launch_context(false)).await.unwrap();
+        let headers_entry = overlay
+            .iter()
+            .find(|b| b.key == "ANTHROPIC_CUSTOM_HEADERS")
+            .expect("ANTHROPIC_CUSTOM_HEADERS should be set");
+        // Headers are formatted as "Name: Value" pairs, newline-separated, sorted by key.
+        assert_eq!(
+            headers_entry.value,
+            "User-Agent: my-agent/1.0\nX-Custom-Header: value1"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_overlay_omits_custom_headers_when_none_set() {
+        let l = launcher_with(
+            Some(crate::capabilities::AgentModelBinding {
+                api_type: crate::providers::ApiType::Anthropic,
+                provider_name: "test".to_string(),
+                base_url: "http://test".to_string(),
+                model_name: "test-model".to_string(),
+                endpoint_path: "/v1/messages".to_string(),
+                api_key: Some(crate::registry::Secret::from("test-key")),
+                verify_ssl: true,
+                context_length: Some(4096),
+                custom_headers: None,
+            }),
+            vec![],
+        );
+        let overlay = l.env_overlay(&test_launch_context(false)).await.unwrap();
+        let headers_entry = overlay.iter().find(|b| b.key == "ANTHROPIC_CUSTOM_HEADERS");
+        assert!(headers_entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn env_overlay_omits_custom_headers_when_empty_map() {
+        let l = launcher_with(
+            Some(crate::capabilities::AgentModelBinding {
+                api_type: crate::providers::ApiType::Anthropic,
+                provider_name: "test".to_string(),
+                base_url: "http://test".to_string(),
+                model_name: "test-model".to_string(),
+                endpoint_path: "/v1/messages".to_string(),
+                api_key: Some(crate::registry::Secret::from("test-key")),
+                verify_ssl: true,
+                context_length: Some(4096),
+                custom_headers: Some(HashMap::new()),
+            }),
+            vec![],
+        );
+        let overlay = l.env_overlay(&test_launch_context(false)).await.unwrap();
+        let headers_entry = overlay.iter().find(|b| b.key == "ANTHROPIC_CUSTOM_HEADERS");
+        assert!(headers_entry.is_none());
     }
 
     #[test]
@@ -558,6 +669,7 @@ mod tests {
                 api_key: None,
                 verify_ssl: true,
                 context_length: Some(4096),
+                custom_headers: None,
             },
             known_type: None,
         }
@@ -791,6 +903,7 @@ mod tests {
                 api_key: None,
                 verify_ssl: true,
                 context_length: Some(4096),
+                custom_headers: None,
             }),
             vec![(
                 "reviewer".to_string(),
@@ -883,9 +996,6 @@ mod tests {
         }
         fn description(&self) -> &str {
             "test double"
-        }
-        fn dependencies(&self) -> Vec<crate::capabilities::Dependency> {
-            vec![]
         }
         fn binding_types(&self) -> HashSet<BindingType> {
             HashSet::from([BindingType::SubAgent])

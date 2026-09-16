@@ -383,7 +383,7 @@ async fn proxy_handler(
     match forward(&state, method, uri, headers, body).await {
         Ok(response) => response,
         Err(e) => {
-            alog_channel!(MessageLevel::Warning, "session proxy forward failed: {e}");
+            alog_channel!(MessageLevel::Debug3, "session proxy forward failed: {e}");
             (StatusCode::BAD_GATEWAY, format!("proxy error: {e}")).into_response()
         }
     }

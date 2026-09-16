@@ -177,7 +177,7 @@ impl Ui for TerminalOutput {
         if !self.is_tty {
             return PlainOutput.warn(msg);
         }
-        println!(
+        eprintln!(
             "{}{}Warning:{} {}",
             SetForegroundColor(Color::Yellow),
             SetAttribute(Attribute::Bold),

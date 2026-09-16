@@ -76,7 +76,7 @@ impl Ui for PlainOutput {
         println!("{msg}");
     }
     fn warn(&self, msg: &str) {
-        println!("Warning: {msg}");
+        eprintln!("Warning: {msg}");
     }
     fn error(&self, msg: &str) {
         eprintln!("Error: {msg}");

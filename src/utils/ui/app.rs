@@ -152,6 +152,7 @@ impl App {
                 &instances,
                 false,
                 ctx.ui.as_ref(),
+                &crate::utils::hardware::detect_hardware(),
             )
         };
         let configured_only = [
@@ -1031,12 +1032,9 @@ impl App {
                         .collect();
                     lines.push(Line::from(""));
                     if let Some(mc) = self.ctx.config.get_model(id) {
-                        let provider_val = match &mc.provider_id {
-                            None => "(not set)".to_string(),
-                            Some(pid) => match self.ctx.config.get_provider(pid) {
-                                None => pid.clone(),
-                                Some(pc) => format!("{pid} ({})", pc.provider_type),
-                            },
+                        let provider_val = match self.ctx.config.get_provider(&mc.provider_id) {
+                            None => mc.provider_id.clone(),
+                            Some(pc) => format!("{} ({})", mc.provider_id, pc.provider_type),
                         };
                         let variant_val = match &mc.variant {
                             Some(v) => v.clone(),
@@ -1846,7 +1844,15 @@ mod tests {
     fn recommend_rows_all_have_six_columns() {
         let ui: Box<dyn crate::utils::ui::base::Ui + Send + Sync> =
             Box::new(crate::utils::ui::base::tests::CaptureUi::default());
-        for row in ModelCommands::recommend_rows(None, None, &[], false, &*ui) {
+        let profile = crate::utils::hardware::HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 512.0,
+        };
+        for row in ModelCommands::recommend_rows(None, None, &[], false, &*ui, &profile) {
             assert_eq!(row.len(), 6, "each recommend row must have 6 columns");
         }
     }

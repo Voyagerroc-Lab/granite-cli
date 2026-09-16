@@ -174,6 +174,13 @@ pub trait Ui: Send + Sync + Any {
         msg.to_string()
     }
 
+    /// Whether this session can prompt at all. False for backends whose
+    /// output is meant to be read by a program rather than a person, which
+    /// have nobody to ask.
+    fn is_interactive(&self) -> bool {
+        true
+    }
+
     /// Ask the user to pick one of `items`, returning the chosen index.
     fn select(&self, prompt: &str, items: &[String], default: usize) -> anyhow::Result<usize> {
         Ok(dialoguer::Select::new()
@@ -318,6 +325,11 @@ pub(crate) mod tests {
         pub pull_finishes: RefCell<Vec<(PullHandle, String, Option<String>)>>,
         /// Counter used to allocate sequential PullHandles.
         pub next_pull_handle: RefCell<u64>,
+
+        /// Answer for `is_interactive()`. `None`, the default, answers true,
+        /// so a test only sets this when it is testing what happens without
+        /// a person to ask.
+        pub interactive: RefCell<Option<bool>>,
     }
 
     impl ConfigConstructable for CaptureUi {
@@ -333,6 +345,10 @@ pub(crate) mod tests {
     }
 
     impl Ui for CaptureUi {
+        fn is_interactive(&self) -> bool {
+            self.interactive.borrow().unwrap_or(true)
+        }
+
         fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
             self.tables.borrow_mut().push((
                 title.to_string(),

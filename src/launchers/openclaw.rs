@@ -240,13 +240,28 @@ fn generate_config(
             "api": "openai-completions",
             "models": [model_entry],
         });
+        // API Key is required even if the provider doesn't use it
+        let mut api_key_val = serde_json::Value::String("unused".to_string());
         if let Some(api_key) = binding
             .api_key
             .as_ref()
             .map(|api_key| api_key.0.clone())
             .filter(|key| !key.is_empty())
         {
-            provider_entry["apiKey"] = serde_json::Value::String(api_key);
+            api_key_val = serde_json::Value::String(api_key);
+        }
+        provider_entry["apiKey"] = api_key_val;
+
+        // Add custom headers from binding if present. Omit entirely when
+        // custom_headers is empty to match the behavior of other launchers.
+        if let Some(headers) = &binding.custom_headers {
+            if !headers.is_empty() {
+                let header_map: serde_json::Map<String, serde_json::Value> = headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.0.clone())))
+                    .collect();
+                provider_entry["headers"] = serde_json::Value::Object(header_map);
+            }
         }
 
         let mut providers = serde_json::Map::new();
@@ -263,17 +278,19 @@ fn generate_config(
         for (name, binding) in mcp_bindings {
             servers.insert(name.clone(), {
                 match binding {
-                    McpBinding::Stdio { command, args, env } => serde_json::json!({
+                    McpBinding::Stdio {
+                        command, args, env, ..
+                    } => serde_json::json!({
                         "command": command,
                         "args": args,
                         "env": env,
                     }),
-                    McpBinding::Http { url, headers } => serde_json::json!({
+                    McpBinding::Http { url, headers, .. } => serde_json::json!({
                         "url": url,
                         "transport": "streamable-http",
                         "headers": headers,
                     }),
-                    McpBinding::Sse { url, headers } => serde_json::json!({
+                    McpBinding::Sse { url, headers, .. } => serde_json::json!({
                         "url": url,
                         "transport": "sse",
                         "headers": headers,
@@ -318,6 +335,7 @@ mod tests {
             api_key: None,
             verify_ssl: true,
             context_length: Some(131072),
+            custom_headers: None,
         }
     }
 
@@ -425,10 +443,9 @@ mod tests {
             "my-ollama/granite4.1:8b"
         );
         // No key means no apiKey field at all.
-        assert!(
-            config["models"]["providers"]["my-ollama"]
-                .get("apiKey")
-                .is_none()
+        assert_eq!(
+            config["models"]["providers"]["my-ollama"]["apiKey"],
+            "unused"
         );
     }
 
@@ -450,6 +467,7 @@ mod tests {
         let mcp_binding = McpBinding::Http {
             url: "http://127.0.0.1:9999".to_string(),
             headers: Default::default(),
+            timeout: None,
         };
         let config = generate_config(None, &[("vision".to_string(), mcp_binding)]);
         assert!(config.get("models").is_none());
@@ -469,6 +487,7 @@ mod tests {
             command: "/usr/local/bin/granite-cli".to_string(),
             args: vec!["__mcp-serve".to_string(), "vision".to_string()],
             env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            timeout: None,
         };
         let config = generate_config(None, &[("vision".to_string(), mcp_binding)]);
         assert_eq!(
@@ -477,6 +496,50 @@ mod tests {
         );
         assert_eq!(config["mcp"]["servers"]["vision"]["args"][0], "__mcp-serve");
         assert_eq!(config["mcp"]["servers"]["vision"]["env"]["FOO"], "bar");
+    }
+
+    #[test]
+    fn generate_config_includes_headers_when_present() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom".to_string(), Secret::from("value1"));
+        headers.insert("Authorization".to_string(), Secret::from("Bearer token"));
+        let b = AgentModelBinding {
+            custom_headers: Some(headers),
+            ..binding()
+        };
+        let config = generate_config(Some(&b), &[]);
+        assert_eq!(
+            config["models"]["providers"]["my-ollama"]["headers"]["Authorization"],
+            "Bearer token"
+        );
+        assert_eq!(
+            config["models"]["providers"]["my-ollama"]["headers"]["X-Custom"],
+            "value1"
+        );
+    }
+
+    #[test]
+    fn generate_config_omits_headers_when_none() {
+        let config = generate_config(Some(&binding()), &[]);
+        assert!(
+            config["models"]["providers"]["my-ollama"]
+                .get("headers")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generate_config_omits_headers_when_empty() {
+        let b = AgentModelBinding {
+            custom_headers: Some(std::collections::HashMap::new()),
+            ..binding()
+        };
+        let config = generate_config(Some(&b), &[]);
+        assert!(
+            config["models"]["providers"]["my-ollama"]
+                .get("headers")
+                .is_none()
+        );
     }
 
     // -- env overlay -----------------------------------------------------------
@@ -501,9 +564,11 @@ mod tests {
             .find(|b| b.key == "OPENCLAW_CONFIG_PATH")
             .expect("config redirect");
         assert!(
-            config
-                .value
-                .ends_with("launcher-state/openclaw/openclaw.json"),
+            Path::new(&config.value).ends_with(
+                Path::new("launcher-state")
+                    .join("openclaw")
+                    .join("openclaw.json")
+            ),
             "{}",
             config.value
         );

@@ -34,6 +34,25 @@ impl CapabilitySource {
             .capabilities
             .values()
             .filter_map(|capability_config| {
+                // A capability whose references do not resolve cannot bind:
+                // `model.provider()` fails without a provider, and a model
+                // that is gone panics inside `ConfiguredModel::resolve` (#90)
+                // before construction can even report the failure. Skip it
+                // rather than reach either.
+                if let Err(e) = crate::config::validation::validate_ref(
+                    crate::config::validation::RefKind::Capability,
+                    &capability_config.capability_id,
+                    config,
+                ) {
+                    alog_channel!(
+                        MessageLevel::Warning,
+                        "Skipping capability '{}': {}",
+                        capability_config.capability_id,
+                        e
+                    );
+                    return None;
+                }
+
                 let result = CAPABILITY_REGISTRY.construct(
                     &capability_config.capability_type,
                     &capability_config.capability_id,
@@ -109,7 +128,7 @@ pub use sub_agent_plan::{PlanSubAgentCapability, PlanSubAgentCapabilityConfig};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CapabilityConfig, Config, ModelConfig};
+    use crate::config::{CapabilityConfig, Config, ModelConfig, ProviderConfig};
     use crate::dependency::Configured;
 
     fn agent_model_config(id: &str, model_key: &str) -> CapabilityConfig {
@@ -125,14 +144,23 @@ mod tests {
     #[test]
     fn capability_source_constructs_one_instance_per_named_capability() {
         let mut config = Config::default();
-        // Add the model entry that the capability will look up.
+        // The model needs a provider to bind, so the capability is only
+        // constructible with one configured.
+        config.providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
-                provider_id: None,
+                provider_id: "ollama".to_string(),
                 variant: None,
             },
         );
@@ -158,6 +186,20 @@ mod tests {
             },
         );
 
+        let source = CapabilitySource::from_config(&config);
+        assert!(source.instances().is_empty());
+    }
+
+    #[test]
+    fn capability_source_skips_a_capability_whose_model_is_gone() {
+        let mut config = Config::default();
+        config.capabilities.insert(
+            "chat".to_string(),
+            agent_model_config("chat", "granite-3.1-8b-instruct"),
+        );
+
+        // No model entry, so constructing `chat` would panic inside
+        // ConfiguredModel::resolve. It is skipped before reaching that.
         let source = CapabilitySource::from_config(&config);
         assert!(source.instances().is_empty());
     }

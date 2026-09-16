@@ -202,6 +202,21 @@ macro_rules! define_factory {
 
                 /// Construct an instance by name with the given configuration.
                 ///
+                /// `name` selects the registered implementation. `instance_id`,
+                /// `cfg` and `global_config` go to that implementation's
+                /// `ConfigConstructable::new` unchanged, so `cfg` is what decides
+                /// the instance:
+                /// - A saved instance's config produces that configured instance,
+                ///   and `instance_id` is the config key it came from.
+                /// - A default or ad-hoc config produces an ephemeral instance of
+                ///   a type that is not configured, built to inspect it. The API
+                ///   expects `name` as the value of `instance_id` in this case,
+                ///   since there is no config key.
+                ///
+                /// `instance_id` is only the label the instance reports through
+                /// [`Named`]. It is never looked up in `global_config`, so an id
+                /// that is not configured constructs the same as one that is.
+                ///
                 /// # Arguments
                 ///
                 /// * `name` - The name of the implementation to construct

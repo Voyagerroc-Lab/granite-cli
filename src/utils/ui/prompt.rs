@@ -1,6 +1,6 @@
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 // Local
 use crate::utils::ui::Ui;
@@ -61,7 +61,9 @@ fn prompt_object(
     }
 
     let mut result = serde_json::Map::new();
-    if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+    let properties = node.get("properties").and_then(Value::as_object);
+
+    if let Some(properties) = properties {
         let child_indent = format!("{indent}  ");
         for (name, prop_schema) in properties {
             let prop_schema = resolve_ref(root, prop_schema);
@@ -78,6 +80,60 @@ fn prompt_object(
             result.insert(name.clone(), value);
         }
     }
+
+    // Handle additionalProperties (e.g., HashMap<String, T> fields)
+    if let Some(additional_props_schema_val) = node.get("additionalProperties") {
+        let additional_props_schema = resolve_ref(root, additional_props_schema_val);
+        // Only handle additionalProperties if the value schema is promptable
+        if get_promptable_type(additional_props_schema).is_some()
+            || enum_choices(root, additional_props_schema).is_some()
+        {
+            let child_indent = format!("{indent}  ");
+
+            // Get remaining defaults: keys in default that aren't explicit properties
+            let default_obj = default.as_object().cloned().unwrap_or_default();
+            let remaining_defaults: Vec<(String, Value)> = default_obj
+                .iter()
+                .filter(|(k, _)| !result.contains_key(k.as_str()))
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+
+            let mut defaults_iter = remaining_defaults.into_iter();
+
+            loop {
+                let next_default = defaults_iter.next();
+                let add = ui.confirm(&format!("{indent}Add {label}?"), next_default.is_some())?;
+                if !add {
+                    break;
+                }
+                let (key_default_str, item_default) = next_default
+                    .unwrap_or((String::new(), zero_value_for(additional_props_schema)));
+
+                // Prompt for the key (always a string for JSON object keys)
+                let key_schema = json!({"type": "string"});
+                let key_value = prompt_string(
+                    ui,
+                    &key_schema,
+                    &json!(key_default_str),
+                    &child_indent,
+                    "key",
+                )?;
+                let key_str = key_value.as_str().unwrap().to_string();
+
+                // Prompt for the value using the additionalProperties schema
+                let value = prompt_value(
+                    ui,
+                    root,
+                    additional_props_schema,
+                    &item_default,
+                    &child_indent,
+                    &key_str,
+                )?;
+                result.insert(key_str, value);
+            }
+        }
+    }
+
     Ok(Value::Object(result))
 }
 
@@ -484,6 +540,7 @@ fn zero_value_for(schema: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
 
     #[test]
@@ -1046,5 +1103,86 @@ mod tests {
         assert_eq!(result, json!({"tools": ["FileRead", "Shell"]}));
         assert_eq!(ui.multi_select_prompts.borrow().len(), 1);
         assert!(ui.confirm_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn prompt_from_schema_handles_hashmap_string_string() {
+        use crate::utils::ui::base::tests::CaptureUi;
+        use std::collections::HashMap;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+        struct TestConfig {
+            headers: HashMap<String, String>,
+        }
+
+        let ui = CaptureUi::default();
+        ui.confirm_answers.borrow_mut().push_back(true); // Add headers?
+        ui.text_answers
+            .borrow_mut()
+            .push_back("X-API-Key".to_string()); // key
+        ui.text_answers.borrow_mut().push_back("my-key".to_string()); // value
+        ui.confirm_answers.borrow_mut().push_back(false); // Add headers? no more
+
+        let defaults = json!({"headers": {"X-API-Key": "default-key"}});
+        let schema = schemars::schema_for!(TestConfig);
+        let result = prompt_from_schema(&ui, &schema, &defaults).unwrap();
+
+        assert_eq!(result["headers"], json!({"X-API-Key": "my-key"}));
+    }
+
+    #[test]
+    fn prompt_from_schema_handles_hashmap_string_secret() {
+        use crate::registry::Secret;
+        use crate::utils::ui::base::tests::CaptureUi;
+        use std::collections::HashMap;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+        struct TestConfig {
+            custom_headers: HashMap<String, Secret>,
+        }
+
+        let ui = CaptureUi::default();
+        ui.confirm_answers.borrow_mut().push_back(true); // Add custom_headers?
+        ui.text_answers
+            .borrow_mut()
+            .push_back("Authorization".to_string()); // key
+        ui.password_answers
+            .borrow_mut()
+            .push_back("Bearer my-token".to_string()); // value
+        ui.confirm_answers.borrow_mut().push_back(false); // Add custom_headers? no more
+
+        let defaults = json!({"custom_headers": {"Authorization": "Bearer default-token"}});
+        let schema = schemars::schema_for!(TestConfig);
+        let result = prompt_from_schema(&ui, &schema, &defaults).unwrap();
+
+        assert_eq!(
+            result["custom_headers"],
+            json!({"Authorization": "Bearer my-token"})
+        );
+    }
+
+    #[test]
+    fn prompt_from_schema_handles_hashmap_without_defaults() {
+        use crate::utils::ui::base::tests::CaptureUi;
+        use std::collections::HashMap;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+        struct TestConfig {
+            headers: HashMap<String, String>,
+        }
+
+        let ui = CaptureUi::default();
+        ui.confirm_answers.borrow_mut().push_back(true); // Add headers?
+        ui.text_answers
+            .borrow_mut()
+            .push_back("X-API-Key".to_string()); // key
+        ui.text_answers.borrow_mut().push_back("my-key".to_string()); // value
+        ui.confirm_answers.borrow_mut().push_back(false); // Add headers? no more
+
+        let defaults = json!({"headers": {}}); // empty defaults
+        let schema = schemars::schema_for!(TestConfig);
+        let result = prompt_from_schema(&ui, &schema, &defaults).unwrap();
+
+        assert_eq!(result["headers"], json!({"X-API-Key": "my-key"}));
     }
 }

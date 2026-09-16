@@ -394,6 +394,13 @@ impl OpenCodeLauncher {
         {
             options["apiKey"] = serde_json::Value::String(format!("{{env:{api_key_env}}}"));
         }
+        if let Some(headers) = &binding.custom_headers {
+            let header_map: serde_json::Map<String, serde_json::Value> = headers
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.0.clone())))
+                .collect();
+            options["headers"] = serde_json::Value::Object(header_map);
+        }
 
         // `limit` is all-or-nothing in OpenCode's schema: if present, both
         // `context` and `output` are required. granite-cli only tracks a
@@ -1054,7 +1061,9 @@ fn generate_config(
         for (name, binding) in mcp_bindings {
             mcp.insert(name.clone(), {
                 match binding {
-                    McpBinding::Stdio { command, args, env } => {
+                    McpBinding::Stdio {
+                        command, args, env, ..
+                    } => {
                         let mut full_command = vec![command.clone()];
                         full_command.extend(args.iter().cloned());
                         serde_json::json!({
@@ -1063,7 +1072,8 @@ fn generate_config(
                             "environment": env,
                         })
                     }
-                    McpBinding::Http { url, headers } | McpBinding::Sse { url, headers } => {
+                    McpBinding::Http { url, headers, .. }
+                    | McpBinding::Sse { url, headers, .. } => {
                         serde_json::json!({
                             "type": "remote",
                             "url": url,
@@ -1110,6 +1120,7 @@ mod tests {
             api_key: None,
             verify_ssl: true,
             context_length: Some(131072),
+            custom_headers: None,
         }
     }
 
@@ -1297,6 +1308,31 @@ mod tests {
             .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(entry["npm"], "@ai-sdk/openai");
+    }
+
+    #[test]
+    fn provider_entry_includes_custom_headers_when_present() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Helicone-Cache-Enabled".to_string(),
+            Secret("true".to_string()),
+        );
+        headers.insert(
+            "Helicone-User-Id".to_string(),
+            Secret("opencode".to_string()),
+        );
+        let b = AgentModelBinding {
+            custom_headers: Some(headers),
+            ..binding()
+        };
+        let entry = launcher(serde_json::json!({}))
+            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .unwrap();
+        assert_eq!(
+            entry["options"]["headers"]["Helicone-Cache-Enabled"],
+            "true"
+        );
+        assert_eq!(entry["options"]["headers"]["Helicone-User-Id"], "opencode");
     }
 
     // -- provider_api_key_env ---------------------------------------------------
@@ -1553,6 +1589,7 @@ mod tests {
         let mcp_binding = McpBinding::Http {
             url: "http://127.0.0.1:9999".to_string(),
             headers: Default::default(),
+            timeout: None,
         };
         let config = generate_config(
             None,
@@ -1616,9 +1653,11 @@ mod tests {
             .find(|b| b.key == "OPENCODE_CONFIG")
             .expect("config redirect");
         assert!(
-            config
-                .value
-                .ends_with("launcher-state/opencode/opencode.json"),
+            Path::new(&config.value).ends_with(
+                Path::new("launcher-state")
+                    .join("opencode")
+                    .join("opencode.json")
+            ),
             "{}",
             config.value
         );
@@ -1819,9 +1858,6 @@ mod tests {
         }
         fn description(&self) -> &str {
             "test double"
-        }
-        fn dependencies(&self) -> Vec<crate::capabilities::Dependency> {
-            vec![]
         }
         fn binding_types(&self) -> HashSet<BindingType> {
             HashSet::from([BindingType::SubAgent])

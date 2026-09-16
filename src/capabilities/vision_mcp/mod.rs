@@ -126,19 +126,6 @@ impl Capability for VisionMCPCapability {
         "Exposes a vision-language model as an MCP server (compare/analyze images) for a launched coding agent to call."
     }
 
-    fn dependencies(&self) -> Vec<Dependency> {
-        vec![Dependency::Model {
-            config_key: "model_id".to_string(),
-            requirement: ModelRequirement {
-                model_type: Some(ModelType::Vision),
-                supported_functions: vec![ModelFunction::Chat, ModelFunction::ImageUnderstanding],
-                ..Default::default()
-            },
-            resolved_id: Some(self.config.model_id.clone()),
-            required: true,
-        }]
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         HashSet::from([BindingType::Mcp])
     }
@@ -196,6 +183,7 @@ impl Capability for VisionMCPCapability {
         Ok(Binding::Mcp(McpBinding::Http {
             url,
             headers: HashMap::new(),
+            timeout: None,
         }))
     }
 
@@ -295,10 +283,17 @@ mod tests {
         fn verify_ssl(&self) -> bool {
             self.verify_ssl
         }
+        fn custom_headers(&self) -> Option<StdHashMap<String, Secret>> {
+            None
+        }
         fn supported_formats(&self) -> Vec<ModelFormat> {
             vec![]
         }
-        fn model_alias(&self, _variant: Option<&ModelVariant>) -> Option<String> {
+        fn model_alias(
+            &self,
+            _model_id: String,
+            _variant: Option<&ModelVariant>,
+        ) -> Option<String> {
             self.alias.clone()
         }
         async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
@@ -394,7 +389,7 @@ mod tests {
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
-                provider_id: None,
+                provider_id: "ollama".to_string(),
                 variant: None,
             },
         );

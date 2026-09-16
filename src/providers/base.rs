@@ -137,6 +137,13 @@ pub trait Provider: crate::registry::Named + Send + Sync {
     /// Returns the configured API key for this provider instance, if any.
     fn api_key(&self) -> Option<&Secret>;
 
+    /// Returns the configured custom HTTP headers for this provider instance, if any.
+    /// Custom headers are used as-is in outgoing requests. Keys are the header names
+    /// (strings) and values are secret tokens.
+    fn custom_headers(&self) -> Option<HashMap<String, Secret>> {
+        None
+    }
+
     /// Returns whether this provider instance verifies SSL certificates.
     fn verify_ssl(&self) -> bool;
 
@@ -151,7 +158,7 @@ pub trait Provider: crate::registry::Named + Send + Sync {
     /// naming convention (e.g. Ollama's `granite4.1:8b` vs the catalog ID
     /// `granite-4.1-8b`) override this to derive the alias from the variant URL.
     /// The default returns `None`, meaning the catalog ID should be used as-is.
-    fn model_alias(&self, _variant: Option<&ModelVariant>) -> Option<String> {
+    fn model_alias(&self, _model_id: String, _variant: Option<&ModelVariant>) -> Option<String> {
         None
     }
 

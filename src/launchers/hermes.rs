@@ -263,6 +263,14 @@ impl HermesLauncher {
                 model["api_key"] = serde_json::Value::String(format!("${{{API_KEY_ENV}}}"));
             }
 
+            // Add custom headers as extra_headers if configured.
+            // Sorted by key for deterministic output.
+            if let Some(ref headers) = binding.custom_headers {
+                if !headers.is_empty() {
+                    model["extra_headers"] = serde_json::to_value(headers)?;
+                }
+            }
+
             // Merge user-provided overrides on top so they win on conflict.
             // Special case: if the override key is "model", merge the inner
             // object into config["model"] rather than replacing it entirely.
@@ -294,12 +302,15 @@ impl HermesLauncher {
             for (name, binding) in &self.bound_mcp_bindings {
                 mcp_servers.insert(name.clone(), {
                     match binding {
-                        McpBinding::Stdio { command, args, env } => serde_json::json!({
+                        McpBinding::Stdio {
+                            command, args, env, ..
+                        } => serde_json::json!({
                             "command": command,
                             "args": args,
                             "env": env,
                         }),
-                        McpBinding::Http { url, headers } | McpBinding::Sse { url, headers } => {
+                        McpBinding::Http { url, headers, .. }
+                        | McpBinding::Sse { url, headers, .. } => {
                             serde_json::json!({
                                 "url": url,
                                 "headers": headers,
@@ -470,6 +481,7 @@ mod tests {
             api_key: None,
             verify_ssl: true,
             context_length: Some(131072),
+            custom_headers: None,
         }
     }
 
@@ -639,6 +651,7 @@ mod tests {
                 command: "/usr/local/bin/granite-cli".to_string(),
                 args: vec!["__mcp-serve".to_string(), "vision".to_string()],
                 env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+                timeout: None,
             },
         ));
         l.bound_mcp_bindings.push((
@@ -649,6 +662,7 @@ mod tests {
                     "Authorization".to_string(),
                     "Bearer x".to_string(),
                 )]),
+                timeout: None,
             },
         ));
         let config = l.generate_config().unwrap();
@@ -691,7 +705,7 @@ mod tests {
             .find(|b| b.key == HERMES_HOME_ENV)
             .expect("HERMES_HOME env");
         assert!(
-            home.value.ends_with("launcher-state/hermes"),
+            Path::new(&home.value).ends_with(Path::new("launcher-state").join("hermes")),
             "{}",
             home.value
         );

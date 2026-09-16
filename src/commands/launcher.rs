@@ -4,6 +4,7 @@ use anyhow::Result;
 
 // Local
 use crate::capabilities::{CAPABILITY_REGISTRY, CapabilitySource};
+use crate::config::validation::RefKind;
 use crate::dependency::Configured;
 use crate::launchers::LAUNCHER_REGISTRY;
 use crate::utils::prompt_from_schema;
@@ -35,6 +36,7 @@ impl LauncherCommands {
 
     /// List all configured launcher instances.
     pub fn list(ctx: &crate::AppContext) -> Result<()> {
+        let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Launcher);
         let mut rows: Vec<Vec<String>> = ctx
             .config
             .launchers
@@ -46,7 +48,12 @@ impl LauncherCommands {
                     .and_then(|v| v.as_str())
                     .unwrap_or("(PATH)")
                     .to_string();
-                vec![id.clone(), cfg.launcher_type.clone(), command]
+                vec![
+                    id.clone(),
+                    cfg.launcher_type.clone(),
+                    command,
+                    notes.get(id).cloned().unwrap_or_default(),
+                ]
             })
             .collect();
         rows.sort_by(|a, b| {
@@ -59,10 +66,88 @@ impl LauncherCommands {
 
         ctx.ui.table(
             &format!("Configured Launchers ({} launchers)", rows.len()),
-            &["ID", "TYPE", "COMMAND"],
+            &["ID", "TYPE", "COMMAND", "NOTES"],
             &rows,
         );
         Ok(())
+    }
+
+    pub fn info(ctx: &crate::AppContext, id: &str) -> Result<()> {
+        let configured = ctx.config.get_launcher(id);
+
+        let metadata = configured
+            .and_then(|c| LAUNCHER_REGISTRY.get(&c.launcher_type))
+            .or_else(|| LAUNCHER_REGISTRY.get(id));
+
+        match metadata {
+            Some(md) => {
+                let mut type_fields: Vec<(&str, String)> = vec![
+                    ("Name", md.name.clone()),
+                    ("Description", md.description.clone()),
+                    ("Default Command", md.default_command.clone()),
+                ];
+
+                let mut caps: Vec<_> = md
+                    .supported_capabilities
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect();
+                if !caps.is_empty() {
+                    caps.sort();
+                    type_fields.push(("Supported Capabilities", caps.join(", ")));
+                }
+
+                if !md.tags.is_empty() {
+                    type_fields.push(("Tags", md.tags.join(", ")));
+                }
+
+                ctx.ui.detail("Type Metadata", &type_fields);
+
+                if let Some(cfg) = configured {
+                    let mut instance_fields: Vec<(&str, String)> = Vec::new();
+
+                    instance_fields.push(("Config: Type", cfg.launcher_type.clone()));
+
+                    if !cfg.enabled_capabilities.is_empty() {
+                        instance_fields
+                            .push(("Enabled Capabilities", cfg.enabled_capabilities.join(", ")));
+                    }
+
+                    if let Some(obj) = cfg.config.as_object() {
+                        for (k, v) in obj {
+                            instance_fields.push(("Config", format!("{k} = {v}")))
+                        }
+                    }
+
+                    ctx.ui.detail(id, &instance_fields);
+                }
+
+                Ok(())
+            }
+            None => {
+                if configured.is_some() {
+                    let fields: Vec<(&str, String)> = vec![(
+                        "Note",
+                        "Configured but its type is not found in the bundled registry".to_string(),
+                    )];
+                    ctx.ui.detail(id, &fields);
+                    Ok(())
+                } else {
+                    ctx.ui
+                        .info(&format!("Launcher '{id}' not found in registry."));
+
+                    let available: Vec<_> = crate::launchers::LAUNCHER_REGISTRY
+                        .entries()
+                        .keys()
+                        .map(|k| k.to_string())
+                        .collect();
+                    ctx.ui
+                        .info(&format!("Available launchers: {}", available.join(", ")));
+
+                    anyhow::bail!("Launcher not found");
+                }
+            }
+        }
     }
 
     /// Interactive launcher setup wizard.
@@ -232,6 +317,33 @@ impl LauncherCommands {
         Ok(())
     }
 
+    /// Configuration integrity check for `launch`: validates the launcher,
+    /// the capabilities it enables, and what those resolve to, offering a fix
+    /// for anything broken.
+    ///
+    /// Declining aborts the launch rather than skipping, because a capability
+    /// that cannot bind would fail later during the launch itself. This runs
+    /// before anything about the environment, so a configuration problem is
+    /// reported before a missing binary is.
+    pub async fn prelaunch(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
+        let outcome = crate::commands::shared::remediation::remediate(
+            ctx,
+            RefKind::Launcher,
+            launcher_id,
+            crate::commands::shared::remediation::OnDecline::Abort,
+            true,
+        )
+        .await?;
+
+        if outcome == crate::commands::shared::remediation::Outcome::Unresolved {
+            anyhow::bail!(
+                "Launch aborted: launcher '{launcher_id}' has a configuration problem \
+                 that was not fixed."
+            );
+        }
+        Ok(())
+    }
+
     /// Remove a configured launcher instance by ID.
     ///
     /// Deletes the launcher's config file and removes it from the in-memory
@@ -240,6 +352,21 @@ impl LauncherCommands {
     pub fn remove(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
         if ctx.config.get_launcher(launcher_id).is_none() {
             anyhow::bail!("No launcher configured with id '{launcher_id}'. Nothing to remove.");
+        }
+
+        // Anything pointing at it would be stranded by this removal.
+        match crate::commands::shared::remediation::confirm_removal(
+            ctx,
+            RefKind::Launcher,
+            launcher_id,
+        )? {
+            crate::commands::shared::remediation::Removal::Cancel => {
+                ctx.ui.info(&format!("Keeping launcher '{launcher_id}'."));
+                return Ok(());
+            }
+            crate::commands::shared::remediation::Removal::Proceed { with } => {
+                crate::commands::shared::remediation::remove_all(ctx, &with)?;
+            }
         }
 
         if let Err(e) = ctx.config.remove_launcher(launcher_id) {
@@ -277,6 +404,8 @@ async fn select_capabilities(
     let mut enabled: Vec<String> = previously_enabled.to_vec();
     // Newly-configured capability IDs collected across loop iterations.
     let mut result: Vec<String> = vec![];
+    // Whether the note about carried-through ids has been shown.
+    let mut announced = false;
 
     loop {
         let source = CapabilitySource::from_config(&ctx.config);
@@ -293,6 +422,25 @@ async fn select_capabilities(
             .map(|(id, _)| id)
             .collect();
         compatible_instances.sort();
+
+        // Ids this launcher already enables that cannot be offered: the
+        // instance is gone, its references do not resolve, or it does not
+        // bind to anything this launcher supports. They are carried through
+        // rather than dropped, since editing a launcher should not disable
+        // what it already had. `launch` reports each one and offers a fix.
+        let carried: Vec<String> = previously_enabled
+            .iter()
+            .filter(|id| !compatible_instances.contains(id))
+            .cloned()
+            .collect();
+        if !carried.is_empty() && !announced {
+            ctx.ui.warn(&format!(
+                "Left enabled but not listed below: {}. Each one is missing or \
+                 has a reference that does not resolve.",
+                carried.join(", ")
+            ));
+            announced = true;
+        }
 
         // Catalog types whose supported_binding_types intersect the launcher's set.
         let compatible_types: Vec<&'static str> = {
@@ -345,6 +493,11 @@ async fn select_capabilities(
         }
 
         if !configure_new_chosen {
+            for id in carried {
+                if !result.contains(&id) {
+                    result.push(id);
+                }
+            }
             break;
         }
 
@@ -408,6 +561,16 @@ mod tests {
                 .downcast_ref::<CaptureUi>()
                 .unwrap()
                 .tables
+                .borrow()
+        };
+    }
+
+    macro_rules! details {
+        ($ctx:expr) => {
+            (&*($ctx.ui) as &dyn std::any::Any)
+                .downcast_ref::<CaptureUi>()
+                .unwrap()
+                .details
                 .borrow()
         };
     }
@@ -504,6 +667,101 @@ mod tests {
         assert_eq!(rows[0][1], "bob");
         assert_eq!(rows[1][0], "a-claude");
         assert_eq!(rows[2][0], "z-claude");
+    }
+
+    // -- info -----------------------------------------------------------------
+
+    #[test]
+    fn info_unknown_launcher_returns_err() {
+        let ctx = test_ctx();
+        let result = LauncherCommands::info(&ctx, "does-not-exist");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Launcher not found")
+        );
+    }
+
+    #[test]
+    fn info_catalog_launcher_renders_detail() {
+        let ctx = test_ctx();
+        let result = LauncherCommands::info(&ctx, "claude");
+
+        assert!(result.is_ok());
+
+        let details = details!(ctx);
+        assert_eq!(details.len(), 1);
+
+        let (id, fields) = &details[0];
+        assert_eq!(id, "Type Metadata");
+        assert!(fields.iter().any(|(k, _)| *k == "Name"));
+        // Config fields should not be present for catalog-only lookups
+        assert!(!fields.iter().any(|(k, _)| k.starts_with("Config")));
+    }
+
+    #[test]
+    fn info_configured_launcher_renders_detail_with_config() {
+        let mut ctx = ctx_with_launcher("my-claude", "claude");
+
+        if let Some(cfg) = ctx.config.launchers.get_mut("my-claude") {
+            cfg.enabled_capabilities = vec!["chat".to_string(), "plan".to_string()];
+        }
+
+        let result = LauncherCommands::info(&ctx, "my-claude");
+
+        assert!(result.is_ok());
+
+        let details = details!(ctx);
+        assert_eq!(details.len(), 2);
+
+        let (id1, fields1) = &details[0];
+        assert_eq!(id1, "Type Metadata");
+        assert!(fields1.iter().any(|(k, _)| *k == "Name"));
+
+        let (id2, fields2) = &details[1];
+        assert_eq!(id2, "my-claude");
+
+        assert!(
+            fields2
+                .iter()
+                .any(|(k, v)| *k == "Config: Type" && v == "claude")
+        );
+        assert!(
+            fields2
+                .iter()
+                .any(|(k, v)| *k == "Enabled Capabilities" && v == "chat, plan")
+        );
+    }
+
+    #[test]
+    fn info_configured_unknown_type_renders_note() {
+        let mut ctx = test_ctx();
+        ctx.config.launchers.insert(
+            "custom-launcher".to_string(),
+            LauncherConfig {
+                launcher_id: "custom-launcher".to_string(),
+                launcher_type: "not-a-real-type".to_string(),
+                ..LauncherConfig::default()
+            },
+        );
+
+        let result = LauncherCommands::info(&ctx, "custom-launcher");
+
+        assert!(result.is_ok());
+
+        let details = details!(ctx);
+        assert_eq!(details.len(), 1);
+
+        let (id, fields) = &details[0];
+        assert_eq!(id, "custom-launcher");
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| *k == "Note" && v.contains("not found in the bundled registry"))
+        );
     }
 
     // -- setup (type-aware clash detection) ------------------------------------
@@ -616,13 +874,23 @@ mod tests {
     // Also adds the model to config.models so CapabilitySource::from_config
     // can construct the underlying AgentModelCapability.
     fn add_capability(ctx: &mut crate::AppContext, cap_id: &str, model_id: &str) {
+        // The model needs a provider to bind, so a capability is only
+        // constructible, and so only listed, with one configured.
+        ctx.config.providers.insert(
+            "ollama".to_string(),
+            crate::config::ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
         ctx.config.models.insert(
             model_id.to_string(),
             crate::config::ModelConfig {
                 model_id: model_id.to_string(),
                 model_type: model_id.to_string(),
                 config: serde_json::json!({}),
-                provider_id: None,
+                provider_id: "ollama".to_string(),
                 variant: None,
             },
         );
@@ -707,6 +975,37 @@ mod tests {
         assert!(
             prompts[0].1.contains(&"my-agent".to_string()),
             "expected instance id in items"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_capabilities_carries_through_an_id_it_cannot_offer() {
+        let mut ctx = test_ctx();
+        add_capability(&mut ctx, "my-agent", "granite-3.1-8b-instruct");
+        let launcher_def = claude_launcher_def();
+        {
+            let ui = capture_ui!(ctx);
+            // Select "my-agent", the only instance on offer.
+            ui.multi_select_answers.borrow_mut().push_back(vec![0]);
+        }
+
+        // `gone` is enabled but not configured, so it cannot be listed.
+        let previously_enabled = vec!["my-agent".to_string(), "gone".to_string()];
+        let result = select_capabilities(&mut ctx, &launcher_def, &previously_enabled)
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains(&"gone".to_string()),
+            "editing a launcher must not disable what it could not offer: {result:?}"
+        );
+        let ui = capture_ui!(ctx);
+        let items = &ui.multi_select_prompts.borrow()[0].1;
+        assert!(!items.contains(&"gone".to_string()), "{items:?}");
+        assert!(
+            ui.warns.borrow().iter().any(|w| w.contains("gone")),
+            "the carried id is named: {:?}",
+            ui.warns.borrow()
         );
     }
 

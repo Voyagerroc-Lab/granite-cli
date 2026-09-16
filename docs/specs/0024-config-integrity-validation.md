@@ -50,7 +50,7 @@ ids in different places:
 ┌──────────────────┐
 │    ModelConfig   │
 └──────────────────┘
-         │  provider_id: Option<String>
+         │  provider_id: String
          │  (wrapper field; no type knowledge needed)
          ▼
 ┌──────────────────┐
@@ -78,9 +78,43 @@ one hop at a time (Sub-Task 1):
 fn validate_ref(kind: RefKind, id: &str, config: &Config)
     -> Result<(), ValidationError>
 
-enum ValidationError {
-    NotConfigured { kind: RefKind, id: String, reason: String },
-    Other(String),
+struct ValidationError {
+    /// What did not resolve.
+    target: (RefKind, String),
+    problem: Problem,
+    /// The configured instance holding the broken reference, absent when the
+    /// instance asked about is itself the problem.
+    referrer: Option<(RefKind, String)>,
+}
+
+enum Problem {
+    NotConfigured,
+    UnknownType { type_name: String },
+    MissingDependency { config_key: String },
+}
+```
+
+The referrer is there because a caller acting on a failure acts on the
+instance that holds the reference, not on the missing thing. `launch claude`
+finding that `chat`'s model is gone offers to reconfigure `chat`, and the
+prompt in Sub-Task 2 names it. `Problem` is an enum rather than a message so
+that caller branches on a variant instead of on text.
+
+A caller names what it is about to use and branches on the failure to decide
+what to offer:
+
+```rust
+// The launch check: the launcher, its enabled capabilities, their models,
+// and those models' providers.
+validate_ref(RefKind::Launcher, "claude", &config)?;
+
+// A failure names what to act on as well as what is missing, so a caller
+// offering a fix reconfigures the capability rather than the model.
+if let Err(e) = validate_ref(RefKind::Capability, "chat", &config) {
+    match (&e.problem, &e.referrer) {
+        (Problem::NotConfigured, Some((kind, id))) => reconfigure(*kind, id),
+        _ => ui.warn(&e.to_string()),
+    }
 }
 ```
 
@@ -88,9 +122,11 @@ The command drives the check, and it covers only what that command names,
 walking transitively from there. A command never reports a problem in a part
 of the configuration it was not asked about, so an unrelated broken entry
 does not block the work in hand. Construction cannot be the driver instead,
-because `ModelSource::from_config` is eager and is rebuilt inside
-`ConfiguredModel::resolve()`, so building one instance already touches the
-whole configuration.
+because `construct()` serves two kinds of caller and cannot tell them apart.
+One builds an instance drawn from the configuration. The other builds a
+transient instance of something that is deliberately not configured, which is
+how the setup wizard probes provider and launcher types and how `model setup`
+builds a model before saving it. Only the caller knows which it is.
 
 ```
 capability setup chat     ->  chat, its model, that model's provider
@@ -100,11 +136,11 @@ model list                ->  every model (the command's whole subject)
 provider remove ollama    ->  whatever currently points at ollama
 ```
 
-The same check also runs inside construction, to remove the panic. The
-factory's generated `construct()` calls it before building an instance and
-returns an error if a reference does not resolve. Today that path aborts the
-process instead: `ConfiguredModel::resolve()` panics when a capability names
-a model that is no longer configured.
+Validation runs where something is about to be used, and nowhere else,
+so a broken entry blocks only the commands that would have used it.
+A list command is the one case that walks every instance of a kind,
+because its subject is every instance of that kind.
+
 
 ### 2. Notifying and remediating
 
@@ -153,11 +189,14 @@ it (Sub-Task 5).
 ## Out of Scope (Future Work)
 
 - Broken candidates in `setup` selection lists. `*Source::from_config`
-  filters a dangling instance out of `instances()`, so a broken model never
-  appears in "Select a model for this capability" and reads as one that was
-  never configured. Listing it with `ui.warn_mark` and forcing a reconfigure
-  when it is picked would say more, but it changes the candidate lists of
-  every `setup` flow, which is wider than this refactor.
+  filters a dangling instance out of `instances()`, so a broken model or
+  capability never appears in "Select a model for this capability" and reads
+  as one that was never configured. Listing it with `ui.warn_mark` and
+  forcing a reconfigure when it is picked would say more, but it changes the
+  candidate lists of every `setup` flow, which is wider than this refactor.
+  Launcher setup does say what it could not offer, and carries a
+  previously-enabled id through rather than dropping it, so editing a launcher
+  never disables what the walk would otherwise report.
 - Runtime liveness (#36). Whether a provider is actually reachable is a
   separate axis from whether config references resolve, and giving `Model`,
   `Capability` and `Launcher` a `health_check()` is its own piece of work.
@@ -170,11 +209,17 @@ it (Sub-Task 5).
   specifies stderr only for `error`. Whether `warn` should join it is a
   policy question about the trait, not about config integrity.
 - `ModelSource` eagerness (#58). It builds every configured model on each
-  `ConfiguredModel::resolve()`, which is both wasted work and the reason
-  construction cannot be scoped. #58's lazy memoised `construct_shared` is
-  that fix; this plan works around it meanwhile by driving validation from
-  the command layer.
-- Malformed instance config (#59). `ConfigConstructable::new` deserialises
+  `ConfiguredModel::resolve()`, which is wasted work. #58's lazy memoised
+  `construct_shared` is that fix; this plan leaves the eager build in place
+  and drives validation from the command layer.
+- The `ConfiguredModel::resolve` panic itself (#90). This plan detects a
+  dangling reference and tells the user about it, and `CapabilitySource`
+  skips an instance whose references do not resolve rather than constructing
+  it, so the construction sites no longer reach the abort. The panic is still
+  there for any caller that resolves a model directly.
+  Fixing that requires making `ConfigConstructable::new` fallible. Once 
+  `global_config` is removed from `ConfigConstructable::new`, the next step
+  will be to make it fallible and fix the panic in #90
   with `unwrap_or_default()`, so a corrupt config silently becomes a default
   rather than an error. Validation here checks that references resolve, not
   that each instance's own config parses.
@@ -183,6 +228,50 @@ it (Sub-Task 5).
 - Cross-process conflict resolution / file locking. granite-cli has no
   daemon; every invocation is load-run-exit, so this is a narrow race, not
   addressed here.
+- Re-typing a broken instance in place (issue to file). When an instance's
+  `*_type` is not in the registry the only repair offered is removal, and
+  removing a model breaks every capability that points at it. Re-typing would
+  keep the instance id, and so every inbound reference, which is what a
+  catalog rename actually calls for. It needs a type picker per kind, which
+  does not exist as a reusable piece today, and it leaves behind an instance
+  id that may still name the old type.
+- The second confirmation when reconfiguring (issue to file). Choosing to
+  reconfigure an instance leads into setup, which then asks whether to
+  overwrite the instance that is already configured, defaulting to no. That
+  is two confirmations for one decision, and accepting the default leaves the
+  reference broken. Fixing it means changing how the four setup commands
+  treat an explicit instance id, which affects every caller of them.
+- A flag for non-interactive removal (issue to file). A session with nobody
+  to ask always removes only what was asked and warns about what that broke.
+  A script has no way to say that it wants the dependents removed too, or
+  that it wants the removal refused when anything depends on the target. A
+  flag on the four removal commands would give it both, and would give the
+  refusal a non-zero exit to act on.
+- Removing a capability without breaking or deleting its launcher (issue to
+  file). A launcher depends on a capability by listing it in
+  `enabled_capabilities`, so the removal prompt's three answers are: delete
+  the launcher too, do nothing, or leave the launcher pointing at something
+  that is gone. None of them deletes exactly what was asked and leaves the
+  launcher working. A fourth choice would drop the id from that list as part
+  of the removal. Reaching that end state today takes two commands: remove
+  only the capability, then accept the disable the next `launch` offers.
+  The behaviour exists in `remediation::disable` and needs extracting to
+  take an explicit launcher and capability id.
+- Sibling problems a declined prompt hides (issue to file). Remediation
+  reports one problem at a time and stops when the user declines, so a
+  launcher with two broken capabilities only ever names the first. Reporting
+  the second would mean gathering every error rather than stopping at the
+  first, which is the collect-all walk Sub-Task 1 deliberately does not have.
+- Launching without a broken capability (issue to file). A launcher with
+  several enabled capabilities cannot start while any one of them is broken:
+  declining the prelaunch aborts, and there is no way to run with the rest.
+  Acknowledging the problem is not enough on its own, because the capability
+  stays enabled and model resolution panics when it is constructed (#90). The
+  repair is to drop the broken id from `enabled_capabilities` for that run
+  only, which `run_launch` can do on the clone it already takes, and which
+  re-validation then reports clean. It needs a fourth action on the prelaunch
+  prompt, a line naming what was dropped so the reduced session is visible,
+  and a decision about what to do when every capability is broken.
 
 ---
 
@@ -210,18 +299,19 @@ Each kind reads its references from where they actually live. A launcher
 walks the ids in `enabled_capabilities`. A capability looks up its type's
 static `dependencies` in the registry and, for each entry, reads the id from
 its own config JSON under that entry's `config_key`. A model reads
-`provider_id`. Providers have no outbound references and always pass.
+`provider_id`. Providers have no outbound references between instances.
 
-A model with no `provider_id` at all fails, distinctly from one whose
-`provider_id` points at nothing:
+Each of the four kinds also names its implementation type (`*_type` fields),
+and that reference is checked too. 
 
-```
-provider_id: None            ->  "no provider configured"
-provider_id: Some(dangling)  ->  "provider 'ollama' is not configured"
-```
+A capability's dependency is validated whenever it holds an id, whether the
+dependency is declared required or not, so a dangling optional dependency is
+reported exactly like a dangling required one.
 
-Both are unusable today, since every path that reaches a model needs its
-provider, but they are different problems and the messages should say so.
+`ModelConfig.provider_id` is required, so a model always names a provider and
+the only thing that can be wrong with it is that the name resolves to nothing,
+which reads like any other dangling reference: "provider 'ollama' is not
+configured".
 
 Alongside it, a helper answers the same question for a whole kind at once,
 which is what a list command needs:
@@ -246,31 +336,32 @@ already prefers the static form, and the only callers of the instance form
 are five tests, which move to metadata. This leaves `metadata()` as the one
 place a capability says what it needs.
 
-The factory's generated `construct()` calls `validate_ref` before building
-and returns an error instead of proceeding. This stops
-`ConfiguredModel::resolve()` panicking on a dangling reference, and gives
-`*Source::from_config` the skip-and-warn outcome #90 asks for.
 
-Its public signature is unchanged: it already returns `Result<_, String>`,
-and the validation error converts into that string.
 
 Tests cover: a healthy and a dangling instance of each kind, confirming only
 the dangling one fails; a launcher → capability → model → provider chain with
 only the provider missing, confirming the walk recurses rather than stopping
-one hop deep; the two `provider_id` cases producing different messages;
-`find_dangling` against a config seeded with several known-broken instances
-returning exactly the expected list; and a config whose capability references
-a removed model, driven through `construct()`, returning an error where it
-previously panicked.
+one hop deep; `find_dangling` against a config seeded with several
+known-broken instances returning exactly the expected list.
 
 **Relevant Context**
 - `src/capabilities/base.rs` (`CapabilityMetadata.dependencies`, `Dependency`, `Capability::dependencies`)
 - `src/commands/capability.rs:196-198` (comment on preferring metadata over an instance)
 - `src/commands/setup.rs:513-530` (existing static-metadata read)
-- `src/models/base.rs:251-261` (`ConfiguredModel::resolve`, the panic)
-- `src/registry/mod.rs` (`define_factory!`, generated `construct`)
+- `src/commands/setup.rs:122-138`, `:335-350` (discovery constructing types
+  that are deliberately not configured)
+- `src/commands/model.rs:610-615` (a live instance built before anything is
+  written)
+- `src/models/mod.rs:35-59` (`ModelSource::from_config`, which constructs a
+  model whether or not its provider resolves)
+- `src/registry/mod.rs:203-231` (the `construct` doc comment)
+- `src/capabilities/base.rs:346-376` (`Display for Dependency`, which already
+  distinguishes required from optional to the user)
+- `src/commands/capability.rs:278-300`, `:420` (`resolve_model_dependency` and
+  `resolve_provider_dependency`, where an unsatisfiable optional dependency is
+  left unset)
 
-**Status** — `[ ]` not started
+**Status** — `[x] done`
 
 ---
 
@@ -294,30 +385,75 @@ fn is_interactive(&self) -> bool  // default: true
 
 The prompt walks broken references one at a time, offering three choices:
 reconfigure the instance, which drives the existing per-type setup command
-pre-selected on the right instance; remove it, via the existing removal
-command; or skip it and leave it as-is. Skip is also the automatic fallback
-whenever prompting is not offered, either because the session is not
-interactive or because the command is running in a non-prompting mode such as
-`setup --auto`. `launch` is the exception, aborting by default instead of
-skipping.
+pre-selected on the right instance; remove it; or skip it and leave it as-is.
+Skip is also the automatic fallback whenever prompting is not offered, either
+because the session is not interactive or because the command is running in a
+non-prompting mode such as `setup --auto`. `launch` is the exception,
+aborting by default instead of skipping.
+
+What removal means depends on how remediation was reached. A caller that
+named the instance itself, such as `capability info chat`, is offered deletion
+through the existing removal command. Remediation reached through a launcher
+is offered disabling instead: the id is dropped from that launcher's
+`enabled_capabilities` and the capability stays configured. A capability may
+be enabled by several launchers, so `launch claude` offering to delete one
+would change more than the launcher it was asked about. Both shapes a launcher
+produces are covered, whether the enabled capability is itself broken or is
+not configured at all.
+
+An unknown type name is the one case with two choices rather than three.
+Setup cannot run a type that is not in the registry, so offering to
+reconfigure would only produce a failed fix, and removal is the only repair
+on offer.
 
 Remediation is a loop rather than a single pass. After a fix is accepted the
 caller re-runs the same scoped validation and prompts for whatever is still
-broken, including anything the fix itself introduced. The loop ends when
-validation comes back clean, or when a whole pass changes nothing, which is
-what a run of skips produces, so a user who keeps declining is never asked
-about the same reference twice.
+broken, including anything the fix itself introduced. It ends in one of three
+ways: validation comes back clean, the user declines, or every repair on offer
+has been tried against the same problem.
+
+A repair that leaves the problem exactly as it was is dropped from the choices
+rather than ending the run. Reconfiguring is the case that matters: a user who
+walks out of the wizard, or who goes in to change something else, comes back to
+the same question with the remaining repairs still reachable instead of having
+to re-run the command. A different problem starts over with all of them.
+
+Declining ends the whole loop rather than moving to the next problem. The
+scoped walk is deterministic and reports one problem at a time, so the next
+pass would report the reference just declined. This means a launcher with two
+broken capabilities only ever names the first, which a list command shows in
+full.
+
+Removing the instance the caller asked about leaves it unresolved, since what
+the caller named no longer validates. For `launch` that is the right answer
+anyway, and for an info or detail command it means there is nothing left to
+show.
+
+There is no "1 of N" counter. A scoped walk stops at the first problem, so a
+total is not knowable without gathering every error, which Sub-Task 1
+deliberately does not do.
 
 ```
-⚠ Configuration issue (1 of 2)
+⚠ Configuration issue: capability 'chat' depends on model
+  'granite-3.1-8b-instruct', which is not configured
 
-  Capability 'chat' (agent-model) depends on model
-  'granite-3.1-8b-instruct', which is no longer configured.
+? What would you like to do?
+  [1] Reconfigure capability 'chat' now
+  [2] Remove capability 'chat'
+> [3] Skip for now, 'chat' stays broken until fixed
+```
 
-  [1] Reconfigure 'chat' now — pick a different model
-  [2] Remove 'chat'
-  [3] Skip for now — 'chat' stays disabled until fixed
->
+Reached through `launch claude`, the same problem offers the launcher's own
+list rather than the shared instance:
+
+```
+⚠ Configuration issue: capability 'chat' depends on model
+  'granite-3.1-8b-instruct', which is not configured
+
+? What would you like to do?
+  [1] Reconfigure capability 'chat' now
+  [2] Remove capability 'chat' from launcher 'claude'
+> [3] Cancel
 ```
 
 Tests cover: canned answers confirming that reconfigure invokes setup
@@ -325,13 +461,21 @@ pre-selected on the right instance, that remove calls the right removal
 function, and that neither a non-interactive session nor an auto-mode flag
 ever reaches the underlying prompt call; a fix that repairs one reference
 while exposing a second, confirming the loop re-validates and prompts again
-before returning; and a pass in which every problem is skipped, confirming
-the loop stops instead of re-offering the same choices.
+before returning; a fix that returns having changed nothing, confirming it
+drops out of the choices while the rest stay reachable, and that a launch can
+still disable after one; a declined
+problem, confirming the loop stops instead of re-offering the same choices;
+an unknown type, confirming removal is offered without reconfiguration; a
+launcher root, confirming disabling is offered in place of deletion for both
+a broken capability and one that is not configured, that it leaves the
+capability configured, and that a caller naming the capability is still
+offered deletion; and the JSON and Markdown backends answering that they
+cannot prompt.
 
 **Relevant Context**
 - `src/commands/capability.rs` (`CapabilityCommands::setup`, reused by reconfigure)
 
-**Status** — `[ ]` not started
+**Status** — `[x] done`
 
 ---
 
@@ -357,34 +501,48 @@ model-3  lm-studio
 They never prompt, whatever they find. A list reports that a problem exists;
 acting on it is left to a command the user chooses to run next.
 
-Info and detail commands validate the instance they were asked about, show a
-warning, and offer the remediation prompt from Sub-Task 2 when the session
-allows prompting.
+`model list` builds its rows from constructed instances, so a model whose
+type is not in the registry never reaches the table and would disappear at
+exactly the moment something is wrong with it. It gets a row of its own,
+carrying the id and the reason with the remaining columns empty. A list
+filtered by model type leaves those rows out, since there is no metadata to
+filter them on.
+
+Info commands validate the instance they were asked about and offer the
+remediation prompt from Sub-Task 2 when the session allows prompting, then
+render the state that results, so what is shown reflects any repair. An id
+that names a catalog type rather than a configured instance is being
+browsed, not diagnosed, and is neither validated nor annotated. Removing the
+instance is one of the offered choices, and leaves the command with nothing
+to show, so it returns without rendering.
 
 `launch` validates the launcher it was asked to run, the capabilities it has
 enabled, and what those resolve to, before starting anything. A broken
 reference is offered the same prompt, but declining aborts the launch rather
 than skipping, because a capability that cannot bind would fail later during
 the launch itself. This check runs before the existing binary check, so a
-config problem is reported before anything about the environment.
+config problem is reported before anything about the environment. It is a
+`prelaunch` function on the launcher commands, called by `run_launch` after
+the configuration is loaded and before the launcher is constructed.
 
 Remediation during a fresh `setup`, for a dependency the wizard is about to
 use, is not built here. It depends on broken candidates being visible in the
 wizard's selection lists, which is out of scope for this plan.
 
-Tests cover: a UI double that panics on `select`/`confirm`, driven through a
-list containing a broken entry, confirming the list never prompts; for info
-and detail, canned answers for each remediation choice against a broken
-instance, confirming the resulting configuration is correct; and, for
-`launch`, that declining remediation aborts before any subprocess is spawned,
-while accepting it proceeds with the repaired configuration.
+Tests cover: a list containing a broken entry, confirming the annotation
+appears and that no prompt is reached; a model whose type is unknown, which
+keeps its row; for info, canned answers for reconfigure and for remove
+against a broken instance, confirming the resulting configuration is
+correct, and a catalog id, confirming it is not diagnosed; and, for the
+launch prelaunch, that declining aborts before anything is constructed
+while accepting proceeds with the repaired configuration.
 
 **Relevant Context**
 - `src/commands/model.rs`, `capability.rs`, `launcher.rs`, `provider.rs`
   (`list` and `info` functions)
-- `src/commands/launcher.rs` (current `launch` pre-flight: `validate_command()` only)
+- `src/commands/launcher.rs` (current `launch` prelaunch: `validate_command()` only)
 
-**Status** — `[ ]` not started
+**Status** — `[x] done`
 
 ---
 
@@ -395,31 +553,49 @@ Stop `Remove` from stranding whatever pointed at what it just deleted.
 
 **Expected Outcomes**
 
-Before any of the four removal methods on `Config` deletes an entry, we scan
-the other configuration maps for anything that depends on the id being
-removed. If something does, the command layer, not `Config` itself per Spec
-0001, offers a choice: remove both together, cancel, or remove only what was
-asked for. Non-interactive backends default to removing only what was asked,
-with a warning.
+Before any of the four removal commands deletes an entry, we scan the other
+configuration maps for anything that depends on the id being removed. If
+something does, the command layer, not `Config` itself per Spec 0001, offers
+a choice: remove both together, cancel, or remove only what was asked for.
+Non-interactive backends default to removing only what was asked, with a
+warning.
+
+Finding the dependents is `Validatable::refs` read backwards: an instance
+depends on the target when the target appears among the references it
+declares. It lives beside the walk in the validation module and needs no
+knowledge of its own about which field holds what.
+
+Cancelling is the default answer, since this is the destructive prompt and
+the other two both delete something. It reports what was kept and succeeds
+rather than failing: the user made a deliberate choice, and a script never
+reaches it, since a session with nobody to ask does not prompt.
 
 ```
-⚠ Removing 'granite-3.1-8b-instruct' will break:
+⚠ Removing model 'granite-3.1-8b-instruct' will break:
   - capability 'chat' (agent-model)
 
-  [1] Remove 'granite-3.1-8b-instruct' and 'chat' together
-  [2] Cancel — keep 'granite-3.1-8b-instruct'
-  [3] Remove only 'granite-3.1-8b-instruct' — fix 'chat' later
->
+? What would you like to do?
+  [1] Remove model 'granite-3.1-8b-instruct' and capability 'chat' together
+> [2] Cancel, keep model 'granite-3.1-8b-instruct'
+  [3] Remove only model 'granite-3.1-8b-instruct', fix the rest later
 ```
+
+Removing the dependents goes through their own removal commands, so anything
+depending on *them* gets the same question in turn. Removing a model the user
+agrees to take a capability with will ask again about the launcher enabling
+that capability. The reference graph runs launcher to capability to model to
+provider, so the questions are bounded by its depth.
 
 Tests cover: a model with one dependent capability producing the right final
 configuration for each of the three outcomes, including the non-interactive
-default.
+default; a removal with no dependents, confirming it does not prompt; and the
+dependents scan itself, in each direction and for a target nothing points
+at.
 
 **Relevant Context**
 - `src/config/mod.rs:318-418` (`remove_model`/`remove_provider`/`remove_capability`/`remove_launcher`, all currently unconditional)
 
-**Status** — `[ ]` not started
+**Status** — `[x] done`
 
 ---
 
@@ -444,7 +620,11 @@ Separately, the provider-selection helper does not re-validate the id it
 returns at all. If a user picks "configure a new provider," types a name that
 collides with an existing provider, and declines to overwrite it, the helper
 still returns that existing provider's id, even if it does not satisfy what
-the model needs. It should get the same re-validation.
+the model needs. It gets the same re-validation, by reading what is
+configured under that id after setup returns and comparing its type against
+the one being configured. A mismatch is rejected with an error naming the
+collision, rather than re-prompted: the wizard has no loop to return to, and
+the message says what to do differently.
 
 The overwrite wizard is the third case. When `setup` presents an existing
 instance's current values as defaults, a default that is itself a dangling
@@ -452,21 +632,94 @@ reference is flagged inline, so pressing Enter through the wizard cannot
 silently re-save it:
 
 ```
-Model for 'chat' [current: granite-4.2-8b — ⚠ no longer configured]:
+Select a model for this capability [current: 'granite-4.2-8b', ⚠ no longer resolves]
   > granite-vision
     granite-3.1-8b
+    Configure a new model...
 ```
+
+The flag says the reference no longer resolves rather than naming which of
+the four problems it is, since the prompt is asking for a replacement either
+way. A current value that still resolves is named without a flag, so the
+wizard always says what pressing Enter would be replacing. The same applies
+to a model's provider, whose current value comes from the instance being
+overwritten.
 
 Tests cover: inserting a provider into an unwritable configuration directory
 returns an error while the entry still appears in memory, which is the root
 cause this sub-task addresses; declining an overwrite onto a mismatched
-existing provider is rejected or re-prompted rather than silently reused; and
-an overwrite wizard whose current value is dangling renders the flag rather
-than offering it as a clean default.
+existing provider is rejected rather than silently reused; and an overwrite
+wizard whose current value is dangling renders the flag, while one that still
+resolves is named without it.
 
 **Relevant Context**
 - `src/config/mod.rs:313-413` (`insert_model`/`insert_provider`/`insert_capability`/`insert_launcher`, `save()`)
 - `src/commands/capability.rs:334-352` (`resolve_model_dependency`)
 - `src/commands/model.rs:722-770` (`select_provider`)
 
-**Status** — `[ ]` not started
+**Status** — `[x] done`
+
+---
+
+## Implementation Summary
+
+Measured against `main` at bf117bb, the commit merged into the branch carrying
+Sub-Tasks 1 to 3. Every production figure excludes the file's own `#[cfg(test)]`
+items. The figures cover everything the two branches carry, which includes
+making `ModelConfig.provider_id` required, a change that came out of the review
+of Sub-Tasks 1 to 3.
+
+### New modules
+
+| Module | Production | Tests | Line coverage |
+|---|---:|---:|---:|
+| `src/config/validation.rs` | 436 | 412 | 98.64% |
+| `src/commands/shared/remediation.rs` | 430 | 552 | 97.92% |
+
+The validator answers three questions, `validate_ref`, `find_dangling` and
+`dependents`, over one `Validatable` implementation per config type.
+Remediation drives the prompts: `remediate`, `confirm_removal`,
+`dangling_notes` and `prompt_with_current`. A third new file,
+`src/commands/shared/mod.rs`, declares the remediation module in four lines.
+
+### Existing code
+
+| | Added | Removed |
+|---|---:|---:|
+| Production | 382 | 110 |
+| Tests | 376 | 145 |
+
+Twenty-four files: the five command modules and the `mod.rs` that declares
+them, the capability registrations, the `Ui` trait with its JSON and Markdown
+backends and the TUI app, `Config`, the model source, the registry macro,
+`main`, and the two launchers whose test doubles implemented the removed
+`dependencies` method.
+
+### Tests
+
+55 new, 27 updated, 8 removed or renamed away. The suite goes from 692 test
+functions to 739, and from 720 passing tests to 767. The gap between the two
+counts is the macro-generated output-contract tests each `Ui` backend gets.
+
+### Coverage
+
+| | Before | After |
+|---|---:|---:|
+| Lines | 78.79% | 80.38% |
+| Regions | 78.45% | 79.91% |
+| Functions | 77.14% | 78.75% |
+
+Measured with `cargo llvm-cov`. Per-file coverage counts a file's own
+`#[cfg(test)]` module, which runs in full, so a file that is half tests reads
+higher than its production half alone. Where the misses sit is exact, since
+test code always executes: `validation.rs` leaves 7 of 516 instrumented lines
+uncovered and `remediation.rs` 14 of 672, and all of those are production
+lines.
+
+### Other
+
+27 Rust files changed, plus this document, and no new dependencies. The
+declaration sites for a capability's `model_id` config key drop from eight to
+four, one per capability type, which is what removing
+`Capability::dependencies(&self)` was for. Neither new module carries
+`#![allow(dead_code)]`: every item has a production caller.

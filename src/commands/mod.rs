@@ -4,6 +4,7 @@ pub mod launcher;
 pub mod model;
 pub mod provider;
 pub mod setup;
+pub mod shared;
 
 pub use capability::CapabilityCommands;
 pub use hardware::HardwareCommands;

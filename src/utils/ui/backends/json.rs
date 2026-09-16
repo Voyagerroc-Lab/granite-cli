@@ -81,6 +81,11 @@ impl ConfigConstructable for JsonOutput {
 }
 
 impl Ui for JsonOutput {
+    /// Output meant for a program to read, with nobody to prompt.
+    fn is_interactive(&self) -> bool {
+        false
+    }
+
     fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
         self.emit(serde_json::json!({
             "type": "table",
@@ -194,6 +199,13 @@ mod tests {
     }
 
     crate::output_contract_tests!(make());
+
+    #[test]
+    fn json_output_is_not_interactive() {
+        // Machine-readable output has nobody to prompt, so commands fall
+        // back to leaving a broken reference alone rather than asking.
+        assert!(!make().is_interactive());
+    }
 
     #[test]
     fn json_table_output_is_valid_json_with_correct_type() {

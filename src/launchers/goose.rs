@@ -7,6 +7,16 @@
 //! session-scoped `--with-extension`/`--with-streamable-http-extension` CLI
 //! flags for MCP servers (goose calls them "extensions").
 
+// Standard
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+// Third Party
+use alog::{MessageLevel, alog_channel, use_channel};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+// Local
 use crate::capabilities::{
     AgentModelBinding, ApiType, Binding, BindingType, Capability, McpBinding,
 };
@@ -15,10 +25,8 @@ use crate::launchers::shared::mcp_cli::mcp_binding_request;
 use crate::registry::ConfigConstructable;
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::PathBuf;
+
+use_channel!("GOOSE");
 
 /*-- public --*/
 
@@ -179,8 +187,37 @@ impl Launcher for GooseLauncher {
                 key: "OPENAI_API_KEY".to_string(),
                 value: api_key_val,
             });
-        }
 
+            // Add custom headers as OPENAI_CUSTOM_HEADERS env var if configured.
+            // Format: HEADER_A=VALUE_A,HEADER_B=VALUE_B, sorted by key for deterministic output.
+            if let Some(ref headers) = binding.custom_headers {
+                if !headers.is_empty() {
+                    let mut header_pairs: Vec<(String, String)> = headers
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                serde_json::to_value(v)
+                                    .unwrap()
+                                    .as_str()
+                                    .unwrap()
+                                    .to_string(),
+                            )
+                        })
+                        .collect();
+                    header_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    let header_lines: Vec<String> = header_pairs
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    overlay.push(EnvBinding {
+                        key: "OPENAI_CUSTOM_HEADERS".to_string(),
+                        value: header_lines.join(","),
+                    });
+                }
+            }
+        }
+        alog_channel!(MessageLevel::Debug4, "Env Overlay: {:#?}", overlay);
         Ok(overlay)
     }
 
@@ -203,7 +240,9 @@ impl Launcher for GooseLauncher {
         let mut extension_flags: Vec<String> = vec![];
         for (_, binding) in &self.bound_mcp_bindings {
             match binding {
-                McpBinding::Stdio { command, args, env } => {
+                McpBinding::Stdio {
+                    command, args, env, ..
+                } => {
                     // Goose's `--with-extension` takes a single shell-style
                     // command string; env vars are inlined as `KEY=value`
                     // prefixes ahead of the command per goose's own docs.
@@ -214,7 +253,7 @@ impl Launcher for GooseLauncher {
                     extension_flags.push("--with-extension".to_string());
                     extension_flags.push(parts.join(" "));
                 }
-                McpBinding::Http { url, headers } | McpBinding::Sse { url, headers } => {
+                McpBinding::Http { url, headers, .. } | McpBinding::Sse { url, headers, .. } => {
                     if !headers.is_empty() {
                         ui.warn(
                             "goose's --with-streamable-http-extension does not support \
@@ -338,6 +377,7 @@ mod tests {
     use super::*;
     use crate::registry::Named;
     use crate::utils::ui::base::tests::CaptureUi;
+    use std::collections::HashMap;
 
     fn launcher(cfg: serde_json::Value) -> GooseLauncher {
         GooseLauncher::new("goose", &cfg, &crate::config::Config::default())
@@ -353,6 +393,7 @@ mod tests {
             api_key: None,
             verify_ssl: true,
             context_length: Some(131072),
+            custom_headers: None,
         }
     }
 
@@ -530,6 +571,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_overlay_includes_custom_headers() {
+        let mut b = binding();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "X-Custom-Header".to_string(),
+            crate::registry::Secret::from("value1"),
+        );
+        headers.insert(
+            "User-Agent".to_string(),
+            crate::registry::Secret::from("my-agent/1.0"),
+        );
+        b.custom_headers = Some(headers);
+        let l = bound(serde_json::json!({}), b);
+        let overlay = l.env_overlay(&ctx(false)).await.unwrap();
+        let headers_entry = overlay
+            .iter()
+            .find(|b| b.key == "OPENAI_CUSTOM_HEADERS")
+            .expect("OPENAI_CUSTOM_HEADERS env");
+        // Headers are formatted as "Name=Value" pairs, comma-separated, sorted by key.
+        assert_eq!(
+            headers_entry.value,
+            "User-Agent=my-agent/1.0,X-Custom-Header=value1"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_overlay_omits_custom_headers_when_none_set() {
+        let l = bound(serde_json::json!({}), binding());
+        let overlay = l.env_overlay(&ctx(false)).await.unwrap();
+        let headers_entry = overlay.iter().find(|b| b.key == "OPENAI_CUSTOM_HEADERS");
+        assert!(headers_entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn env_overlay_omits_custom_headers_when_empty_map() {
+        let mut b = binding();
+        b.custom_headers = Some(HashMap::new());
+        let l = bound(serde_json::json!({}), b);
+        let overlay = l.env_overlay(&ctx(false)).await.unwrap();
+        let headers_entry = overlay.iter().find(|b| b.key == "OPENAI_CUSTOM_HEADERS");
+        assert!(headers_entry.is_none());
+    }
+
+    #[tokio::test]
     async fn env_overlay_uses_real_api_key_when_configured() {
         let b = AgentModelBinding {
             api_key: Some(crate::registry::Secret::from("sk-test")),
@@ -554,6 +639,7 @@ mod tests {
                 command: "granite-cli".to_string(),
                 args: vec!["__mcp-serve".to_string(), "vision".to_string()],
                 env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+                timeout: None,
             },
         );
         let ui = CaptureUi::default();
@@ -581,6 +667,7 @@ mod tests {
             McpBinding::Http {
                 url: "http://127.0.0.1:54321/mcp".to_string(),
                 headers: Default::default(),
+                timeout: None,
             },
         );
         let ui = CaptureUi::default();
@@ -607,6 +694,7 @@ mod tests {
                     "Authorization".to_string(),
                     "Bearer x".to_string(),
                 )]),
+                timeout: None,
             },
         );
         let ui = CaptureUi::default();
