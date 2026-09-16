@@ -2316,53 +2316,24 @@ impl SetupCommands {
 
         // Configure capabilities
         for cap_type in selected_caps {
-            let cap_meta = CAPABILITY_REGISTRY.get(cap_type);
-            let needs_model = cap_meta.as_ref().is_some_and(|meta| {
-                meta.dependencies
-                    .iter()
-                    .any(|d| matches!(d, Dependency::Model { required: true, .. }))
-            });
+            let dependencies = CAPABILITY_REGISTRY
+                .get(cap_type)
+                .map(|meta| meta.dependencies)
+                .unwrap_or_default();
 
-            // Iterate over the capability's model dependencies and resolve
-            // each one: precise mapping wins when present (from
-            // resolved_capability_models), otherwise fall back to the
-            // existing heuristic via find_model_for_capability.
-            let mut cap_model_ids: HashMap<String, String> = HashMap::new();
-            if let Some(meta) = cap_meta.as_ref() {
-                for dep in &meta.dependencies {
-                    let Dependency::Model {
-                        config_key,
-                        required,
-                        ..
-                    } = dep
-                    else {
-                        continue;
-                    };
-                    let model_id = resolved_capability_models
-                        .get(cap_type)
-                        .and_then(|slots| slots.get(config_key.as_str()).cloned())
-                        .or_else(|| Self::find_model_for_capability(cap_type, selected_models));
-
-                    if let Some(id) = model_id {
-                        cap_model_ids.insert(config_key.clone(), id);
-                    } else if *required {
-                        // A required model dependency has no match -- skip this
-                        // capability to avoid panics in CapabilitySource.
-                        ui.warn(&format!(
-                            "Skipping '{cap_type}': no compatible model available."
-                        ));
-                        continue;
-                    }
-                }
-            }
-
-            // Re-check: if we needed a model but found none at all, skip
-            if needs_model && cap_model_ids.is_empty() {
+            // `CapabilitySource` skips a capability whose required model slot
+            // is empty, with a warning, so such a capability is not written.
+            let Some(cap_model_ids) = Self::capability_model_ids(
+                cap_type,
+                &dependencies,
+                resolved_capability_models,
+                selected_models,
+            ) else {
                 ui.warn(&format!(
                     "Skipping '{cap_type}': no compatible model available."
                 ));
                 continue;
-            }
+            };
 
             // An id already configured (e.g. via a previous session or an
             // escape-hatch wizard invoked earlier in this same run) must be
@@ -2486,6 +2457,42 @@ impl SetupCommands {
                     .is_some_and(|p| p.can_run_model(&variant.format, &variant.precision))
             })
             .cloned()
+    }
+
+    /// The model id for each model slot in `dependencies`, keyed by the
+    /// slot's `config_key`. A slot gets the model `resolved_capability_models`
+    /// lists for `cap_type` and that `config_key`, otherwise the result of
+    /// `find_model_for_capability`. An optional slot with no model is left
+    /// out. Returns `None` when any required slot has no model.
+    fn capability_model_ids(
+        cap_type: &str,
+        dependencies: &[Dependency],
+        resolved_capability_models: &HashMap<String, HashMap<String, String>>,
+        selected_models: &HashSet<String>,
+    ) -> Option<HashMap<String, String>> {
+        let mut model_ids = HashMap::new();
+        for dep in dependencies {
+            let Dependency::Model {
+                config_key,
+                required,
+                ..
+            } = dep
+            else {
+                continue;
+            };
+            let model_id = resolved_capability_models
+                .get(cap_type)
+                .and_then(|slots| slots.get(config_key.as_str()).cloned())
+                .or_else(|| Self::find_model_for_capability(cap_type, selected_models));
+            match model_id {
+                Some(id) => {
+                    model_ids.insert(config_key.clone(), id);
+                }
+                None if *required => return None,
+                None => {}
+            }
+        }
+        Some(model_ids)
     }
 
     /// Find a model_id from selected_models that satisfies a capability's model
@@ -4878,6 +4885,109 @@ mod tests {
             .expect("model must still be configured");
         assert_eq!(saved.provider_id, "my-ollama");
         assert_eq!(saved.variant.as_deref(), Some("GGUF/Q4_K_M"));
+    }
+
+    // -- capability_model_ids --------------------------------------------------
+
+    fn model_dependency(config_key: &str, required: bool) -> Dependency {
+        Dependency::Model {
+            config_key: config_key.to_string(),
+            requirement: ModelRequirement::default(),
+            resolved_id: None,
+            required,
+        }
+    }
+
+    #[test]
+    fn capability_model_ids_is_none_when_one_of_two_required_slots_is_empty() {
+        // No registered capability has two model slots, so this uses a
+        // capability type that is not registered: find_model_for_capability
+        // returns None for it, and only `model_id` has a model.
+        let dependencies = [
+            model_dependency("model_id", true),
+            model_dependency("draft_model_id", true),
+        ];
+        let resolved: HashMap<String, HashMap<String, String>> = HashMap::from([(
+            "two-slot-test".to_string(),
+            HashMap::from([("model_id".to_string(), "granite-4.2-8b".to_string())]),
+        )]);
+
+        let model_ids = SetupCommands::capability_model_ids(
+            "two-slot-test",
+            &dependencies,
+            &resolved,
+            &HashSet::new(),
+        );
+
+        assert_eq!(model_ids, None);
+    }
+
+    #[test]
+    fn capability_model_ids_leaves_out_an_empty_optional_slot() {
+        let dependencies = [
+            model_dependency("model_id", true),
+            model_dependency("draft_model_id", false),
+        ];
+        let resolved: HashMap<String, HashMap<String, String>> = HashMap::from([(
+            "two-slot-test".to_string(),
+            HashMap::from([("model_id".to_string(), "granite-4.2-8b".to_string())]),
+        )]);
+
+        let model_ids = SetupCommands::capability_model_ids(
+            "two-slot-test",
+            &dependencies,
+            &resolved,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            model_ids,
+            Some(HashMap::from([(
+                "model_id".to_string(),
+                "granite-4.2-8b".to_string()
+            )]))
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_all_warns_once_for_a_capability_without_a_model() {
+        // agent-model has one required slot and no model is selected. The
+        // capability is skipped with one warning; before, the same warning
+        // was printed twice.
+        let _home = crate::config::TestConfigHome::new();
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext {
+            config: Config::default(),
+            ui: capture.clone(),
+        };
+        let discovery = DiscoveryResult {
+            recommendations: vec![],
+            all_model_candidates: vec![],
+            configured_provider_ids: vec![],
+            configured_model_ids: vec![],
+            configured_launcher_ids: vec![],
+            configured_capability_ids: vec![],
+        };
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &string_set(&["agent-model"]),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *capture.warns.borrow(),
+            vec!["Skipping 'agent-model': no compatible model available.".to_string()]
+        );
+        assert!(ctx.config.get_capability("agent-model").is_none());
     }
 
     #[test]
