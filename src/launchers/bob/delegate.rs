@@ -274,6 +274,7 @@ pub(crate) async fn start_delegate_mcp_server(
         crate::capabilities::McpBinding::Http {
             url,
             headers: HashMap::new(),
+            timeout: Some(7_200_000), // 2 hours in milliseconds
         },
         server,
     ))
