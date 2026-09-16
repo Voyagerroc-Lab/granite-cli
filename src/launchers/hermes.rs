@@ -700,7 +700,7 @@ mod tests {
             .find(|b| b.key == HERMES_HOME_ENV)
             .expect("HERMES_HOME env");
         assert!(
-            home.value.ends_with("launcher-state/hermes"),
+            Path::new(&home.value).ends_with(Path::new("launcher-state").join("hermes")),
             "{}",
             home.value
         );

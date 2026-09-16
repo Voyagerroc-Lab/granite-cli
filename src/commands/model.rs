@@ -990,6 +990,21 @@ mod tests {
         }
     }
 
+    /// A canned hardware profile with generous RAM and no GPU, used so
+    /// `recommend_rows` tests exercise the fit logic deterministically
+    /// instead of depending on whatever hardware (and, on some CI runners,
+    /// misdetected GPU) actually runs the test.
+    fn generous_hardware_profile() -> HardwareProfile {
+        HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 512.0,
+        }
+    }
+
     macro_rules! tables {
         ($ctx:expr) => {
             (&*($ctx.ui) as &dyn std::any::Any)
@@ -1498,9 +1513,19 @@ mod tests {
             "openai-compatible",
             serde_json::json!({ "base_url": "http://localhost:8080" }),
         ));
-        ModelCommands::recommend(&ctx, None, &[], false).unwrap();
+        let source = ProviderSource::from_config(&ctx.config);
+        let instances = source.instances();
+        let providers: Vec<&dyn Provider> = instances.iter().map(|(_, p)| *p).collect();
+        let rows = ModelCommands::recommend_rows(
+            None,
+            Some(&providers),
+            &instances,
+            false,
+            ctx.ui.as_ref(),
+            &generous_hardware_profile(),
+        );
         assert!(
-            !tables!(ctx).is_empty(),
+            !rows.is_empty(),
             "a permissive configured provider should surface recommendations"
         );
     }
@@ -1606,7 +1631,14 @@ mod tests {
     #[test]
     fn recommend_providers_column_is_none_with_no_display_providers() {
         let ui = Box::new(CaptureUi::default());
-        let rows = ModelCommands::recommend_rows(None, None, &[], false, &*ui);
+        let rows = ModelCommands::recommend_rows(
+            None,
+            None,
+            &[],
+            false,
+            &*ui,
+            &generous_hardware_profile(),
+        );
         for row in &rows {
             assert_eq!(
                 row[5], "None",

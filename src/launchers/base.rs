@@ -513,15 +513,15 @@ pub(crate) mod tests {
             base_env: HashMap::new(),
             dry_run: false,
         };
-        let status = run_command(
-            PathBuf::from("/bin/echo"),
-            &[],
-            &["hello".to_string()],
-            &ctx,
-            &ui,
-        )
-        .await
-        .unwrap();
+        #[cfg(unix)]
+        let (binary, args) = (PathBuf::from("/bin/echo"), vec!["hello".to_string()]);
+        #[cfg(windows)]
+        let (binary, args) = (
+            PathBuf::from("cmd"),
+            vec!["/C".to_string(), "echo".to_string(), "hello".to_string()],
+        );
+
+        let status = run_command(binary, &[], &args, &ctx, &ui).await.unwrap();
         assert!(status.success());
     }
 }

@@ -1137,9 +1137,11 @@ mod tests {
             .find(|b| b.key == "OPENCODE_CONFIG")
             .expect("config redirect");
         assert!(
-            config
-                .value
-                .ends_with("launcher-state/opencode/opencode.json"),
+            Path::new(&config.value).ends_with(
+                Path::new("launcher-state")
+                    .join("opencode")
+                    .join("opencode.json")
+            ),
             "{}",
             config.value
         );

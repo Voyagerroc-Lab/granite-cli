@@ -560,9 +560,11 @@ mod tests {
             .find(|b| b.key == "OPENCLAW_CONFIG_PATH")
             .expect("config redirect");
         assert!(
-            config
-                .value
-                .ends_with("launcher-state/openclaw/openclaw.json"),
+            Path::new(&config.value).ends_with(
+                Path::new("launcher-state")
+                    .join("openclaw")
+                    .join("openclaw.json")
+            ),
             "{}",
             config.value
         );

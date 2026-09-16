@@ -1844,7 +1844,15 @@ mod tests {
     fn recommend_rows_all_have_six_columns() {
         let ui: Box<dyn crate::utils::ui::base::Ui + Send + Sync> =
             Box::new(crate::utils::ui::base::tests::CaptureUi::default());
-        for row in ModelCommands::recommend_rows(None, None, &[], false, &*ui) {
+        let profile = crate::utils::hardware::HardwareProfile {
+            os: "test".to_string(),
+            cpu_cores: 8,
+            cpu_arch: "test".to_string(),
+            gpu_vendor: None,
+            vram_gb: None,
+            ram_gb: 512.0,
+        };
+        for row in ModelCommands::recommend_rows(None, None, &[], false, &*ui, &profile) {
             assert_eq!(row.len(), 6, "each recommend row must have 6 columns");
         }
     }
