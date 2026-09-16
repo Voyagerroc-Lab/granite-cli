@@ -1078,6 +1078,56 @@ fn resolve_model_set(
     None
 }
 
+/// The models the wizard binds to the capabilities in `selected_caps`, as
+/// `capability type -> config_key -> model id`, for `configure_all`'s
+/// `resolved_capability_models`. For each model slot, the model is the first
+/// candidate listed in the slot's recommended `RecommendedModelSet.models`
+/// whose catalog id is in `selected_models`. `launcher_types` are read in the
+/// given order, and when two launchers' configs list the same capability, the
+/// first launcher that fills a slot keeps it. A slot with no candidate in
+/// `selected_models` is left out, so `configure_all` falls back to
+/// `find_model_for_capability` for it.
+fn recommended_models_for_selection(
+    ctx: &crate::AppContext,
+    launcher_types: &[String],
+    selected_caps: &HashSet<String>,
+    selected_models: &HashSet<String>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for launcher_type in launcher_types {
+        let effective_caps = recommended_config::effective_capabilities(
+            launcher_type,
+            &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+            &ctx.config.recommended_configs,
+        );
+        for rec_cap in effective_caps {
+            if !selected_caps.contains(&rec_cap.capability) {
+                continue;
+            }
+            for (config_key, set) in &rec_cap.models {
+                if result
+                    .get(&rec_cap.capability)
+                    .is_some_and(|slots| slots.contains_key(config_key))
+                {
+                    continue;
+                }
+                let kept = set
+                    .models
+                    .iter()
+                    .flat_map(|m| matching_catalog_ids(&m.model))
+                    .find(|id| selected_models.contains(id));
+                if let Some(model_id) = kept {
+                    result
+                        .entry(rec_cap.capability.clone())
+                        .or_default()
+                        .insert(config_key.clone(), model_id);
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Whether `md` should be recommended for a capability declaring `req`.
 /// Layers an extra rule on top of `ModelRequirement::admits_type`: if `req`
 /// doesn't itself ask for any multi-modal function, a multi-modal model is
@@ -1181,6 +1231,19 @@ impl SetupCommands {
                     (launcher_type, types)
                 })
                 .collect();
+        // Bind each selected capability to the model its recommended config
+        // lists for it, among the models the user kept in `select_models`.
+        let mut launcher_types: Vec<String> = recommended_capability_types_by_launcher
+            .keys()
+            .cloned()
+            .collect();
+        launcher_types.sort();
+        let resolved_capability_models = recommended_models_for_selection(
+            ctx,
+            &launcher_types,
+            &selected_caps,
+            &selected_models,
+        );
         Self::configure_all(
             ctx,
             &discovery,
@@ -1189,7 +1252,7 @@ impl SetupCommands {
             &selected_providers,
             &selected_models,
             &selected_variants,
-            &HashMap::new(),
+            &resolved_capability_models,
             &recommended_capability_types_by_launcher,
         )
         .await?;
@@ -2352,7 +2415,8 @@ impl SetupCommands {
     }
 
     /// Find a model_id from selected_models that satisfies a capability's model
-    /// requirement. Returns the first matching model or None if no match.
+    /// requirement. Returns the first matching model id in sorted order, or
+    /// None if no model matches.
     fn find_model_for_capability(
         cap_type: &str,
         selected_models: &HashSet<String>,
@@ -2377,9 +2441,12 @@ impl SetupCommands {
         }
 
         // Check each selected model's real catalog metadata to see if it
-        // satisfies any requirement.
-        selected_models
-            .iter()
+        // satisfies any requirement. Sorted, so the result does not depend on
+        // the iteration order of `selected_models`, which changes between runs.
+        let mut candidates: Vec<&String> = selected_models.iter().collect();
+        candidates.sort();
+        candidates
+            .into_iter()
             .find(|model_id| {
                 MODEL_REGISTRY.get(model_id).is_some_and(|md| {
                     all_requirements
@@ -4461,5 +4528,153 @@ mod tests {
             saved.config["custom_field"], custom_config_val,
             "configure_all must not overwrite a manually configured capability's custom config"
         );
+    }
+
+    // -- Wizard model binding --------------------------------------------------
+
+    fn string_set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn recommended_models_for_selection_binds_each_capability_to_its_listed_model() {
+        // claude.yaml lists granite-4.2-30b for sub-agent-code and
+        // granite-4.2-3b for sub-agent-explore. With both models kept, each
+        // capability gets the model listed for it.
+        let ctx = test_ctx();
+        let caps = string_set(&["sub-agent-code", "sub-agent-explore"]);
+        let models = string_set(&["granite-4.2-30b", "granite-4.2-3b"]);
+
+        let resolved =
+            recommended_models_for_selection(&ctx, &["claude".to_string()], &caps, &models);
+
+        assert_eq!(resolved["sub-agent-code"]["model_id"], "granite-4.2-30b");
+        assert_eq!(resolved["sub-agent-explore"]["model_id"], "granite-4.2-3b");
+    }
+
+    #[test]
+    fn recommended_models_for_selection_leaves_out_a_slot_with_no_kept_candidate() {
+        // claude.yaml lists only granite-4.2-30b for sub-agent-code. With only
+        // granite-4.2-3b kept, sub-agent-code gets no entry, so configure_all
+        // uses find_model_for_capability for it.
+        let ctx = test_ctx();
+        let caps = string_set(&["sub-agent-code", "sub-agent-explore"]);
+        let models = string_set(&["granite-4.2-3b"]);
+
+        let resolved =
+            recommended_models_for_selection(&ctx, &["claude".to_string()], &caps, &models);
+
+        assert!(!resolved.contains_key("sub-agent-code"), "{resolved:?}");
+        assert_eq!(resolved["sub-agent-explore"]["model_id"], "granite-4.2-3b");
+    }
+
+    #[test]
+    fn recommended_models_for_selection_uses_the_first_kept_candidate_in_config_order() {
+        // goose has no config of its own, so default.yaml applies. Its
+        // agent-model entry lists granite-4.2-30b before granite-4.2-8b and
+        // does not list granite-4.2-3b. Issue #129 reported agent-model bound
+        // to a 3b model.
+        let ctx = test_ctx();
+        let caps = string_set(&["agent-model"]);
+        let models = string_set(&["granite-4.2-3b", "granite-4.2-8b", "granite-4.2-30b"]);
+
+        let resolved =
+            recommended_models_for_selection(&ctx, &["goose".to_string()], &caps, &models);
+
+        assert_eq!(resolved["agent-model"]["model_id"], "granite-4.2-30b");
+    }
+
+    #[test]
+    fn recommended_models_for_selection_keeps_the_first_launchers_model_for_a_shared_capability() {
+        // claude.yaml lists granite-4.2-30b for sub-agent-code; a user config
+        // for opencode lists granite-4.2-8b. The launchers are read in the
+        // order given, so claude's model is kept.
+        let mut ctx = test_ctx();
+        ctx.config.recommended_configs.insert(
+            "opencode".to_string(),
+            recommended_config::RecommendedConfiguration {
+                launcher: "opencode".to_string(),
+                capabilities: vec![recommended_config::RecommendedCapability {
+                    capability: "sub-agent-code".to_string(),
+                    models: HashMap::from([(
+                        "model_id".to_string(),
+                        recommended_config::RecommendedModelSet {
+                            min_context_length: None,
+                            models: vec![recommended_config::RecommendedModel {
+                                model: recommended_config::StringMatch::Exact(
+                                    "granite-4.2-8b".to_string(),
+                                ),
+                                variant_formats: vec![],
+                                variant_precisions: vec![],
+                            }],
+                        },
+                    )]),
+                }],
+            },
+        );
+        let caps = string_set(&["sub-agent-code"]);
+        let models = string_set(&["granite-4.2-8b", "granite-4.2-30b"]);
+
+        let resolved = recommended_models_for_selection(
+            &ctx,
+            &["claude".to_string(), "opencode".to_string()],
+            &caps,
+            &models,
+        );
+
+        assert_eq!(resolved["sub-agent-code"]["model_id"], "granite-4.2-30b");
+    }
+
+    #[tokio::test]
+    async fn configure_all_binds_wizard_capabilities_to_their_recommended_models() {
+        // run_wizard passes recommended_models_for_selection's result to
+        // configure_all. With an empty map, both capabilities got the same
+        // model, whichever find_model_for_capability returned.
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let discovery = run_discovery(&ctx).await;
+        let launchers = string_set(&["claude"]);
+        let caps = string_set(&["sub-agent-code", "sub-agent-explore"]);
+        let models = string_set(&["granite-4.2-30b", "granite-4.2-3b"]);
+        let providers = string_set(&["ollama"]);
+        let resolved =
+            recommended_models_for_selection(&ctx, &["claude".to_string()], &caps, &models);
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &caps,
+            &launchers,
+            &providers,
+            &models,
+            &HashMap::new(),
+            &resolved,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let model_of = |id: &str| {
+            ctx.config
+                .get_capability(id)
+                .unwrap_or_else(|| panic!("{id} should be configured"))
+                .config["model_id"]
+                .clone()
+        };
+        assert_eq!(model_of("sub-agent-code"), "granite-4.2-30b");
+        assert_eq!(model_of("sub-agent-explore"), "granite-4.2-3b");
+    }
+
+    #[test]
+    fn find_model_for_capability_returns_the_first_match_in_sorted_order() {
+        // Each iteration builds a new HashSet, and each HashSet iterates in a
+        // different order. The result must not change.
+        for _ in 0..20 {
+            let models = string_set(&["granite-4.2-8b", "granite-4.2-3b", "granite-4.2-30b"]);
+            assert_eq!(
+                SetupCommands::find_model_for_capability("sub-agent-code", &models),
+                Some("granite-4.2-30b".to_string())
+            );
+        }
     }
 }
