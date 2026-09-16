@@ -200,14 +200,20 @@ pub enum McpBinding {
         command: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        /// Optional request timeout in milliseconds.
+        timeout: Option<u64>,
     },
     Http {
         url: String,
         headers: HashMap<String, String>,
+        /// Optional request timeout in milliseconds.
+        timeout: Option<u64>,
     },
     Sse {
         url: String,
         headers: HashMap<String, String>,
+        /// Optional request timeout in milliseconds.
+        timeout: Option<u64>,
     },
 }
 
@@ -235,24 +241,48 @@ impl McpBinding {
     /// modelcontextprotocol/modelcontextprotocol#292): `{"type":
     /// "stdio"|"http"|"sse", ...}`.
     pub fn to_canonical_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
         match self {
-            McpBinding::Stdio { command, args, env } => serde_json::json!({
-                "type": "stdio",
-                "command": command,
-                "args": args,
-                "env": env,
-            }),
-            McpBinding::Http { url, headers } => serde_json::json!({
-                "type": "http",
-                "url": url,
-                "headers": headers,
-            }),
-            McpBinding::Sse { url, headers } => serde_json::json!({
-                "type": "sse",
-                "url": url,
-                "headers": headers,
-            }),
+            McpBinding::Stdio {
+                command,
+                args,
+                env,
+                timeout,
+            } => {
+                map.insert("type".into(), serde_json::json!("stdio"));
+                map.insert("command".into(), serde_json::json!(command));
+                map.insert("args".into(), serde_json::json!(args));
+                map.insert("env".into(), serde_json::json!(env));
+                if let Some(t) = timeout {
+                    map.insert("timeout".into(), serde_json::json!(t));
+                }
+            }
+            McpBinding::Http {
+                url,
+                headers,
+                timeout,
+            } => {
+                map.insert("type".into(), serde_json::json!("http"));
+                map.insert("url".into(), serde_json::json!(url));
+                map.insert("headers".into(), serde_json::json!(headers));
+                if let Some(t) = timeout {
+                    map.insert("timeout".into(), serde_json::json!(t));
+                }
+            }
+            McpBinding::Sse {
+                url,
+                headers,
+                timeout,
+            } => {
+                map.insert("type".into(), serde_json::json!("sse"));
+                map.insert("url".into(), serde_json::json!(url));
+                map.insert("headers".into(), serde_json::json!(headers));
+                if let Some(t) = timeout {
+                    map.insert("timeout".into(), serde_json::json!(t));
+                }
+            }
         }
+        serde_json::Value::Object(map)
     }
 }
 
@@ -400,6 +430,7 @@ mod mcp_binding_tests {
             command: "/usr/local/bin/granite-cli".to_string(),
             args: vec!["__mcp-serve".to_string(), "vision".to_string()],
             env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            timeout: None,
         }
     }
 
@@ -407,6 +438,7 @@ mod mcp_binding_tests {
         McpBinding::Http {
             url: "http://127.0.0.1:54321/mcp".to_string(),
             headers: HashMap::from([("X-Test".to_string(), "1".to_string())]),
+            timeout: None,
         }
     }
 
@@ -433,8 +465,32 @@ mod mcp_binding_tests {
         let json = McpBinding::Sse {
             url: "http://127.0.0.1:1/sse".to_string(),
             headers: HashMap::new(),
+            timeout: None,
         }
         .to_canonical_json();
         assert_eq!(json["type"], "sse");
+    }
+
+    #[test]
+    fn canonical_json_includes_timeout_when_set() {
+        let json = McpBinding::Http {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            headers: HashMap::new(),
+            timeout: Some(300_000),
+        }
+        .to_canonical_json();
+        assert_eq!(json["timeout"], 300_000u64);
+    }
+
+    #[test]
+    fn canonical_json_omits_timeout_when_none() {
+        let json = McpBinding::Stdio {
+            command: "my-command".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            timeout: None,
+        }
+        .to_canonical_json();
+        assert!(!json.as_object().unwrap().contains_key("timeout"));
     }
 }

@@ -183,6 +183,7 @@ impl Capability for VisionMCPCapability {
         Ok(Binding::Mcp(McpBinding::Http {
             url,
             headers: HashMap::new(),
+            timeout: None,
         }))
     }
 
