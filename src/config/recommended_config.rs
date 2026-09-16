@@ -48,6 +48,7 @@ pub static BUILTIN_RECOMMENDED_CONFIGS: std::sync::LazyLock<Vec<RecommendedConfi
 /// LAUNCHER_REGISTRY key (e.g. "claude"), or the reserved wildcard "*"
 /// applied to any launcher without its own specific entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecommendedConfiguration {
     pub launcher: String,
     pub capabilities: Vec<RecommendedCapability>,
@@ -56,6 +57,7 @@ pub struct RecommendedConfiguration {
 /// One capability a launcher can auto-enable, and how to fill each of its
 /// model dependency slots.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecommendedCapability {
     /// CAPABILITY_REGISTRY key (e.g. "agent-model").
     pub capability: String,
@@ -67,6 +69,7 @@ pub struct RecommendedCapability {
 
 /// A slot's requirements plus its ordered list of admissible candidates.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecommendedModelSet {
     /// Minimum useful *achieved* context length for this slot, independent
     /// of which candidate is chosen (e.g. a coding-agent capability
@@ -91,6 +94,7 @@ pub struct RecommendedModelSet {
 /// candidates are already tried in order, first admissible one wins, so
 /// this composes for free rather than needing a third list here.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecommendedModel {
     pub model: StringMatch,
     /// Per-model format allow-list (e.g. "GGUF", "Ollama", "OpenRouter");
@@ -429,6 +433,36 @@ mod tests {
             "claude has its own recommended config, so it must not inherit agent-model \
              from the wildcard"
         );
+    }
+
+    #[test]
+    fn every_builtin_recommended_config_parses() {
+        // BUILTIN_RECOMMENDED_CONFIGS drops a file that fails to parse and
+        // logs a warning, so a broken file under resources/recommended_configs
+        // would otherwise only show up at run time.
+        let names: Vec<&str> = RECOMMENDED_CONFIG_SOURCES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            BUILTIN_RECOMMENDED_CONFIGS.len(),
+            RECOMMENDED_CONFIG_SOURCES.len(),
+            "some of {names:?} did not parse"
+        );
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        // `variant_precision` is a misspelling of `variant_precisions`.
+        // Ignoring it would admit every precision of the model.
+        let result = serde_yaml::from_str::<RecommendedModel>(
+            "model: granite-4.2-3b\nvariant_precision: [Q8_0]\n",
+        );
+        assert!(result.is_err());
+
+        let result =
+            serde_yaml::from_str::<RecommendedModelSet>("min_context_lenght: 65536\nmodels: []\n");
+        assert!(result.is_err());
     }
 
     #[test]
