@@ -152,6 +152,7 @@ impl App {
                 &instances,
                 false,
                 ctx.ui.as_ref(),
+                &crate::utils::hardware::detect_hardware(),
             )
         };
         let configured_only = [

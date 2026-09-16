@@ -12,7 +12,7 @@ use crate::providers::{
     PROVIDER_REGISTRY, Provider, ProviderMetadata, ProviderSource, ProviderType, PullResult,
 };
 use crate::utils::Searchable;
-use crate::utils::hardware::detect_hardware;
+use crate::utils::hardware::{HardwareProfile, detect_hardware};
 use crate::utils::prompt_from_schema;
 use crate::utils::ui::Ui;
 
@@ -169,8 +169,8 @@ impl ModelCommands {
         display_providers: &[(String, &dyn Provider)],
         wide: bool,
         ui: &dyn crate::utils::ui::base::Ui,
+        profile: &HardwareProfile,
     ) -> Vec<Vec<String>> {
-        let profile = detect_hardware();
         let models = MODEL_REGISTRY.entries();
 
         let mut rows: Vec<(f64, Vec<String>)> = models
@@ -191,7 +191,7 @@ impl ModelCommands {
                             &m.architecture,
                             &m.native_dtype,
                             v,
-                            &profile,
+                            profile,
                         );
                         (fit, v)
                     })
@@ -328,6 +328,7 @@ impl ModelCommands {
             &instances,
             wide,
             ctx.ui.as_ref(),
+            &detect_hardware(),
         );
         if table_rows.is_empty() {
             let msg = if matches!(&providers, Some(list) if list.is_empty()) {
