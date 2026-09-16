@@ -667,7 +667,11 @@ mod tests {
             .iter()
             .find(|b| b.key == "PI_CODING_AGENT_DIR")
             .expect("config dir redirect");
-        assert!(dir.value.ends_with("launcher-state/pi"), "{}", dir.value);
+        assert!(
+            Path::new(&dir.value).ends_with(Path::new("launcher-state").join("pi")),
+            "{}",
+            dir.value
+        );
 
         let key = overlay
             .iter()
